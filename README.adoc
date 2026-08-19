@@ -1,0 +1,9 @@
+= Copied
+Clipboard Optimized and Polished for Immortalizing Existing Data
+
+( or a few of these words at least )
+
+== Why
+I just want a simple clipboard manager that does what I mean.
+
+Also mostly an excuse to try libxcb and Zig.
