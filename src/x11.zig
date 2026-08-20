@@ -1,5 +1,5 @@
 const std = @import("std");
-const c   = @import("x11");
+const c   = @import("xcb");
 
 const Self = @This();
 
@@ -7,19 +7,23 @@ conn:   *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
 window:  c.xcb_window_t,
 
-atoms:     std.StringHashMapUnmanaged(c.xcb_atom_t) = .empty,
+atoms:     AtomStash,
 clipboard: []const u8 = &.{},
 
 allocator: std.mem.Allocator,
 
-pub fn init(allocator: std.mem.Allocator) !Self {
-    var pref_screen: c_int = undefined;
-
-    const conn = c.xcb_connect(null, &pref_screen) orelse return error.NoDisplay;
+fn xcbConnect(pref_screen: ?*c_int) ?*c.xcb_connection_t {
+    const conn = c.xcb_connect(null, pref_screen) orelse return null;
     errdefer c.xcb_disconnect(conn);
     if (c.xcb_connection_has_error(conn) != 0) {
-        return error.NoDisplay;
+        return null;
     }
+    return conn;
+}
+
+pub fn init(allocator: std.mem.Allocator) !Self {
+    var pref_screen: c_int = undefined;
+    const conn = xcbConnect(&pref_screen) orelse return error.NoDisplay;
 
     const screen: *c.xcb_screen_t = blk: {
         const setup = c.xcb_get_setup(conn);
@@ -49,18 +53,77 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         return error.NoWindow;
     }
 
+    var atoms: AtomStash = .init(conn, allocator);
+    _ = try atoms.intern(3, .{"TARGETS", "INCR", "UTF8_STRING"});
+
     return .{
         .conn   = conn,
         .screen = screen,
         .window = window,
+        .atoms  = atoms,
         .allocator = allocator,
     };
 }
 
 pub fn deinit(self: *Self) void {
-    self.atoms.deinit(self.allocator);
+    self.atoms.deinit();
     self.allocator.free(self.clipboard);
     c.xcb_disconnect(self.conn);
     self.* = undefined;
 }
 
+const AtomStash = struct {
+    conn:      *c.xcb_connection_t,
+    cache:     std.StringHashMapUnmanaged(c.xcb_atom_t) = .empty,
+    allocator: std.mem.Allocator,
+
+    pub fn init(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) AtomStash {
+        return .{
+            .conn      = conn,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *AtomStash) void {
+        self.cache.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn get(self: *AtomStash, name: []const u8) !c.xcb_atom_t {
+        const entry = try self.cache.getOrPut(self.allocator, name);
+        if (entry.found_existing) {
+            return entry.value_ptr.*;
+        }
+
+        const res = try self.intern(1, .{ name });
+        return res[0];
+    }
+
+    pub fn intern(self: *AtomStash, comptime count: usize, names: [count][]const u8) ![count]c.xcb_atom_t {
+        var results: [count]c.xcb_atom_t               = undefined;
+        var cookies: [count]c.xcb_intern_atom_cookie_t = undefined;
+        for (names, &cookies) |name, *cookie| {
+            cookie.* = c.xcb_intern_atom(self.conn, 0, @intCast(name.len), name.ptr);
+        }
+        for (names, cookies, &results) |name, cookie, *res| {
+            const reply = c.xcb_intern_atom_reply(self.conn, cookie, null) orelse return error.NoAtom;
+            defer std.c.free(reply);
+
+            const atom = reply.*.atom;
+            try self.cache.put(self.allocator, name, atom);
+            res.* = atom;
+        }
+        return results;
+    }
+};
+
+test "atom caching" {
+    const conn = xcbConnect(null).?;
+
+    var atoms = AtomStash.init(conn, std.testing.allocator);
+    defer atoms.deinit();
+
+    const name = "image/png";
+    _ = try atoms.get(name);
+    try std.testing.expect(atoms.cache.get(name) != null);
+}

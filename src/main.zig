@@ -1,5 +1,5 @@
 const std = @import("std");
-const X11 = @import("x11.zig");
+const X11 = @import("x11");
 
 const stdin  = std.Io.File.stdin();
 const stdout = std.Io.File.stdout();
@@ -57,6 +57,8 @@ fn run(init: std.process.Init) !void {
             error.NoDisplay => try log(io, "error: Failed to open display"),
             error.NoScreen  => try log(io, "error: Failed to get screen"),
             error.NoWindow  => try log(io, "error: Failed to create window"),
+            error.NoAtom    => try log(io, "error: Failed to intern initial atoms"),
+            else            => {},
         }
         return error.Expected;
     };
