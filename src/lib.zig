@@ -57,7 +57,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     }
 
     var atoms: AtomStash = .init(conn, allocator);
-    const common_atoms = [_][]const u8{"TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list"};
+    const common_atoms = [_][]const u8{"TIMESTAMP", "TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list"};
     _ = try atoms.intern(common_atoms.len, common_atoms);
 
     return .{
@@ -86,6 +86,22 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
         .mime = mime,
         .data = try self.allocator.dupe(u8, data),
     };
+}
+
+pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
+    return c.xcb_get_file_descriptor(self.conn);
+}
+
+pub fn drainXEvents(self: *Self) void {
+    while (c.xcb_poll_for_event(self.conn)) |event| {
+        defer std.c.free(event);
+        self.handleXEvent(event);
+    }
+}
+
+fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
+    _ = self;
+    _ = event;
 }
 
 const AtomStash = struct {
@@ -121,9 +137,9 @@ const AtomStash = struct {
     pub fn getName(self: *AtomStash, atom: c.xcb_atom_t) ![]const u8 {
         if (self.ehcac.get(atom)) |name| return name;
 
-        var results: [1][]const u8 = undefined;
-        try self.getNames(&.{atom}, &results);
-        return results[0];
+        var res: [1][]const u8 = undefined;
+        try self.getNames(&.{atom}, &res);
+        return res[0];
     }
 
     pub fn intern(self: *AtomStash, comptime count: usize, names: [count][]const u8) ![count]c.xcb_atom_t {
@@ -209,20 +225,24 @@ const AtomStash = struct {
             try Missing.resolveBatch(self, missing_batch.items, atoms, results);
         }
     }
+
+    test "AtomStash" {
+        const conn = xcbConnect(null).?;
+
+        var atoms = AtomStash.init(conn, std.testing.allocator);
+        defer atoms.deinit();
+
+        const name = "image/png";
+        const atom = try atoms.get(name);
+        try std.testing.expect(atoms.cache.get(name) != null);
+        try std.testing.expect(atoms.ehcac.get(atom) != null);
+
+        const primary_name = try atoms.getName(c.XCB_ATOM_PRIMARY);
+        const primary_atom = try atoms.get(primary_name);
+        try std.testing.expect(primary_atom == c.XCB_ATOM_PRIMARY);
+    }
 };
 
-test "AtomStash" {
-    const conn = xcbConnect(null).?;
-
-    var atoms = AtomStash.init(conn, std.testing.allocator);
-    defer atoms.deinit();
-
-    const name = "image/png";
-    const atom = try atoms.get(name);
-    try std.testing.expect(atoms.cache.get(name) != null);
-    try std.testing.expect(atoms.ehcac.get(atom) != null);
-
-    const primary_name = try atoms.getName(c.XCB_ATOM_PRIMARY);
-    const primary_atom = try atoms.get(primary_name);
-    try std.testing.expect(primary_atom == c.XCB_ATOM_PRIMARY);
+test {
+    _ = AtomStash;
 }
