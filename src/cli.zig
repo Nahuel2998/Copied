@@ -1,5 +1,5 @@
 const std = @import("std");
-const X11 = @import("x11");
+const X11 = @import("lib");
 
 const stdin  = std.Io.File.stdin();
 const stdout = std.Io.File.stdout();
