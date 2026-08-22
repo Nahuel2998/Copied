@@ -18,9 +18,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "xcb", .module = xcb },
     });
 
-    buildCli(ctx, &.{
-        .{ .name = "lib", .module = lib },
-    });
+    buildCli(ctx, &.{});
     buildDaemon(ctx, &.{
         .{ .name = "lib", .module = lib },
     });

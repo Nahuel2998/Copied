@@ -1,5 +1,7 @@
-const std = @import("std");
-const X11 = @import("lib");
+const std   = @import("std");
+const linux = std.os.linux;
+
+const cmn = @import("cmn.zig");
 
 const stdin  = std.Io.File.stdin();
 const stdout = std.Io.File.stdout();
@@ -51,22 +53,35 @@ fn run(init: std.process.Init) !void {
         }
         source = .{ .filename = arg };
     }
+    std.debug.print("{s}\n", .{mime});
 
-    var x = X11.init(init.gpa) catch |err| {
+    const run_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse {
+        try log(io, "error: XDG_RUNTIME_DIR isn't set");
+        return error.Expected;
+    };
+    const path = cmn.getSockPath(run_dir);
+
+    const sock = createSock(path.buf, path.len) catch |err| {
         switch (err) {
-            error.NoDisplay => try log(io, "error: Failed to open display"),
-            error.NoScreen  => try log(io, "error: Failed to get screen"),
-            error.NoWindow  => try log(io, "error: Failed to create window"),
-            error.NoAtom    => try log(io, "error: Failed to intern initial atoms"),
-            else            => {},
+            error.NoSock    => try log(io, "error: Failed to create sock"),
+            error.NoConnect => try log(io, "error: Failed to connect to sock"),
         }
         return error.Expected;
     };
-    defer x.deinit();
-
-    std.debug.print("{s}\n", .{mime});
+    defer _ = linux.close(sock);
 }
 
 fn log(io: std.Io, comptime message: []const u8) !void {
     try stderr.writeStreamingAll(io, message ++ "\n");
+}
+
+fn createSock(path: [108]u8, path_len: usize) !linux.fd_t {
+    const sock: linux.fd_t = @intCast(cmn.call( linux.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) ) orelse return error.NoSock);
+    errdefer _ = linux.close(sock);
+
+    const addr: std.posix.sockaddr.un = .{ .path = path };
+    const addr_len: u32 = @intCast( @offsetOf(std.posix.sockaddr.un, "path") + path_len + 1 );
+
+    _ = cmn.call( linux.connect(sock, @ptrCast(&addr), addr_len) ) orelse return error.NoConnect;
+    return sock;
 }

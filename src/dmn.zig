@@ -64,68 +64,68 @@ fn run(init: std.process.Init) !void {
 fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboard) void {
     _ = cb;
     // TODO: recv timeout?
-    const client: linux.fd_t = @intCast(call( linux.accept(sock, null, null) ) orelse return);
+    const client: linux.fd_t = @intCast(cmn.call( linux.accept(sock, null, null) ) orelse return);
     defer _ = linux.close(client);
-
-    //      |data_len
-    //   |mime_len
-    // |mode (0 => read; 1 => write)
-    // |x|xx|xxxx|<mime>|<data>|
-    var header: [7]u8 = undefined;
 
     var buf:      [4096]u8 = undefined;
     var reader: cmn.Reader = .{ .fd = client, .read_buf = &buf };
 
-    reader.readInto(&header) catch {
-        std.log.err("Failed to read header from client request", .{});
+    // |mode (0 => read; 1 => write)
+    // |x|mime_len
+    // |x|xx|data_len? (optional; if zero, reading will still be attempted)
+    // |x|xx|xxxx|<mime>|<data>|
+    var header_buf: [7]u8 = undefined;
+    reader.readInto(&header_buf) catch |err| {
+        std.log.err("Failed to read header from client request: {}", .{err});
         return;
     };
-    const mime_len = std.mem.readInt(u16, header[1..3], .little);
-    const data_len = std.mem.readInt(u32, header[3..7], .little);
-    const  res_buf = allocator.alloc(u8, mime_len + data_len) catch {
+    const header = cmn.Header.deserialize(header_buf);
+
+    const res_buf = allocator.alloc(u8, header.mime_len + header.data_len) catch {
         std.log.err("Failed to alloc memory for client request", .{});
         return;
     };
     defer allocator.free(res_buf);
 
-    const mime = res_buf[0..mime_len];
-    reader.readInto(mime) catch {
-        std.log.err("Failed to read mimetype from client request", .{});
+    const mime = res_buf[0..header.mime_len];
+    reader.readInto(mime) catch |err| {
+        std.log.err("Failed to read mimetype from client request: {}", .{err});
         return;
     };
 
-    switch (header[0]) {
-        0 => {
+    switch (header.mode) {
+        .read => {
             // TODO: ...
         },
-        1 => {
-            const data = res_buf[mime_len..];
-            reader.readInto(data) catch {
-                std.log.err("Failed to read data from client request", .{});
-                return;
-            };
+        .write => {
+            var data: []u8 = undefined;
+            if (header.data_len > 0) {
+                data = res_buf[header.mime_len..];
+                reader.readInto(data) catch |err| {
+                    std.log.err("Failed to read data from client request: {}", .{err});
+                    return;
+                };
+            }
+            else {
+                data = reader.readRemainingAlloc(allocator) catch |err| {
+                    std.log.err("Failed to read data from client request: {}", .{err});
+                    return;
+                };
+            }
+            defer if (header.data_len == 0) allocator.free(data);
             // TODO: ...
-        },
-        else => |mode| {
-            std.log.err("Received bogus data: mode={} is not valid", .{mode});
-            return;
         },
     }
 }
 
-fn call(res: usize) ?usize {
-    if (std.posix.errno(res) != .SUCCESS) return null;
-    return res;
-}
-
 fn createSock(path: [108]u8, path_len: usize) !linux.fd_t {
-    const sock: linux.fd_t = @intCast(call( linux.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) ) orelse return error.NoSock);
+    const sock: linux.fd_t = @intCast(cmn.call( linux.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) ) orelse return error.NoSock);
     errdefer _ = linux.close(sock);
 
     const addr: std.posix.sockaddr.un = .{ .path = path };
     const addr_len: u32 = @intCast( @offsetOf(std.posix.sockaddr.un, "path") + path_len + 1 );
 
-    _ = call( linux.bind(sock, @ptrCast(&addr), addr_len) ) orelse return error.NoBind;
-    _ = call( linux.listen(sock, 1) )                       orelse return error.NoListen;
+    _ = cmn.call( linux.bind(sock, @ptrCast(&addr), addr_len) ) orelse return error.NoBind;
+    _ = cmn.call( linux.listen(sock, 1) )                       orelse return error.NoListen;
     return sock;
 }

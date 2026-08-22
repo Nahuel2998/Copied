@@ -3,6 +3,29 @@ const linux = std.os.linux;
 
 const SOCK_NAME = "/copied.sock";
 
+pub const CopyMode = enum { read, write };
+pub const Header = struct {
+    mode:  CopyMode,
+    mime_len: usize,
+    data_len: usize,
+
+    pub fn serialize(self: Header) [7]u8 {
+        const res: [7]u8 = undefined;
+        res[0] = @intFromEnum(self.mode);
+        std.mem.writeInt(u16, &res[1..3], self.mime_len, .little);
+        std.mem.writeInt(u32, &res[3..7], self.data_len, .little);
+        return res;
+    }
+
+    pub fn deserialize(data: [7]u8) Header {
+        return .{
+            .mode = @enumFromInt(data[0]),
+            .mime_len = std.mem.readInt(u16, data[1..3], .little),
+            .data_len = std.mem.readInt(u32, data[3..7], .little),
+        };
+    }
+};
+
 pub const SockPath = struct {
     buf: [108]u8 = undefined,
     len: usize,
@@ -34,6 +57,21 @@ pub const Reader = struct {
             i += data.len;
             @memcpy(result[from..i], data);
         }
+    }
+
+    pub fn readRemainingAlloc(self: *Reader, allocator: std.mem.Allocator) ![]u8 {
+        var res: std.ArrayList(u8) = .empty;
+        errdefer res.deinit(allocator);
+
+        while (true) {
+            const add = self.read(self.read_buf.len) catch |err| switch (err) {
+                error.NoMore => break,
+                else         => return err,
+            };
+            try res.appendSlice(allocator, add);
+        }
+
+        return res.toOwnedSlice(allocator);
     }
 
     fn read(self: *Reader, count: usize) ![]u8 {
@@ -74,3 +112,21 @@ pub const Reader = struct {
         }
     }
 };
+
+pub fn writeAll(fd: linux.fd_t, bytes: []const u8) !void {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const buf = bytes[i..];
+        const write_res = linux.write(fd, buf.ptr, buf.len);
+        switch (std.posix.errno(write_res)) {
+            .SUCCESS => i += write_res,
+            .INTR    => continue,
+            else     => return error.NoWrite,
+        }
+    }
+}
+
+pub fn call(res: usize) ?usize {
+    if (std.posix.errno(res) != .SUCCESS) return null;
+    return res;
+}
