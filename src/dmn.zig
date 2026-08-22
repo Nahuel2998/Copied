@@ -1,8 +1,8 @@
 const std   = @import("std");
 const linux = std.os.linux;
 
+const cmn = @import("cmn.zig");
 const Clipboard = @import("lib");
-const SOCK_NAME = "/copied.sock";
 
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
@@ -24,17 +24,13 @@ fn run(init: std.process.Init) !void {
     };
     defer cb.deinit();
 
-    var   path: [108]u8 = undefined;
     const run_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse {
         std.log.err("XDG_RUNTIME_DIR isn't set", .{});
         return error.Expected;
     };
-    const path_len = run_dir.len + SOCK_NAME.len;
-    @memcpy(path[0           .. run_dir.len],   run_dir);
-    @memcpy(path[run_dir.len ..    path_len], SOCK_NAME);
-    path[path_len] = 0;
+    const path = cmn.getSockPath(run_dir);
 
-    const cli_fd = createSock(path, path_len) catch |err| {
+    const cli_fd = createSock(path.buf, path.len) catch |err| {
         switch (err) {
             error.NoSock   => std.log.err("Failed to create sock", .{}),
             error.NoBind   => std.log.err("Failed to bind sock", .{}),
@@ -44,11 +40,9 @@ fn run(init: std.process.Init) !void {
     };
     defer {
         _ = linux.close(cli_fd);
-        _ = linux.unlink(path[0..path_len:0]);
+        _ = linux.unlink(path.buf[0..path.len:0]);
     }
     const x_fd = cb.getXFileDescriptor();
-
-    if (true) return;
 
     // Look I'd want to use the shiny new Io interface, but I can't .poll() otherwise
     var fds = [_]std.posix.pollfd{
@@ -62,31 +56,76 @@ fn run(init: std.process.Init) !void {
             cb.drainXEvents();
         }
         if (fds[1].revents & std.posix.POLL.IN != 0) {
-            // TODO: Handle cli connection
+            handleCliConnect(init.gpa, cli_fd, &cb);
         }
     }
 }
 
-fn createSock(path: [108]u8, path_len: usize) !linux.fd_t {
-    const sock_res = linux.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-    if (std.posix.errno(sock_res) != .SUCCESS) {
-        return error.NoSock;
+fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboard) void {
+    _ = cb;
+    // TODO: recv timeout?
+    const client: linux.fd_t = @intCast(call( linux.accept(sock, null, null) ) orelse return);
+    defer _ = linux.close(client);
+
+    //      |data_len
+    //   |mime_len
+    // |mode (0 => read; 1 => write)
+    // |x|xx|xxxx|<mime>|<data>|
+    var header: [7]u8 = undefined;
+
+    var buf:      [4096]u8 = undefined;
+    var reader: cmn.Reader = .{ .fd = client, .read_buf = &buf };
+
+    reader.readInto(&header) catch {
+        std.log.err("Failed to read header from client request", .{});
+        return;
+    };
+    const mime_len = std.mem.readInt(u16, header[1..3], .little);
+    const data_len = std.mem.readInt(u32, header[3..7], .little);
+    const  res_buf = allocator.alloc(u8, mime_len + data_len) catch {
+        std.log.err("Failed to alloc memory for client request", .{});
+        return;
+    };
+    defer allocator.free(res_buf);
+
+    const mime = res_buf[0..mime_len];
+    reader.readInto(mime) catch {
+        std.log.err("Failed to read mimetype from client request", .{});
+        return;
+    };
+
+    switch (header[0]) {
+        0 => {
+            // TODO: ...
+        },
+        1 => {
+            const data = res_buf[mime_len..];
+            reader.readInto(data) catch {
+                std.log.err("Failed to read data from client request", .{});
+                return;
+            };
+            // TODO: ...
+        },
+        else => |mode| {
+            std.log.err("Received bogus data: mode={} is not valid", .{mode});
+            return;
+        },
     }
-    const sock: linux.fd_t = @intCast(sock_res);
+}
+
+fn call(res: usize) ?usize {
+    if (std.posix.errno(res) != .SUCCESS) return null;
+    return res;
+}
+
+fn createSock(path: [108]u8, path_len: usize) !linux.fd_t {
+    const sock: linux.fd_t = @intCast(call( linux.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0) ) orelse return error.NoSock);
     errdefer _ = linux.close(sock);
 
     const addr: std.posix.sockaddr.un = .{ .path = path };
     const addr_len: u32 = @intCast( @offsetOf(std.posix.sockaddr.un, "path") + path_len + 1 );
 
-    const bind_res = linux.bind(sock, @ptrCast(&addr), addr_len);
-    if (std.posix.errno(bind_res) != .SUCCESS) {
-        return error.NoBind;
-    }
-
-    const listen_res = linux.listen(sock, 1);
-    if (std.posix.errno(listen_res) != .SUCCESS) {
-        return error.NoListen;
-    }
-
+    _ = call( linux.bind(sock, @ptrCast(&addr), addr_len) ) orelse return error.NoBind;
+    _ = call( linux.listen(sock, 1) )                       orelse return error.NoListen;
     return sock;
 }
