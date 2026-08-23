@@ -62,7 +62,6 @@ fn run(init: std.process.Init) !void {
 }
 
 fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboard) void {
-    _ = cb;
     // TODO: recv timeout?
     const client: linux.fd_t = @intCast(cmn.call( linux.accept(sock, null, null) ) orelse return);
     defer _ = linux.close(client);
@@ -95,8 +94,9 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
 
     switch (header.mode) {
         .read => {
-            // TODO: Send the actual reply
-            cmn.writeAll(client, "hola :)\n") catch |err| {
+            const mime_atom = cb.atoms.getNoIntern(mime) orelse return;
+            const data      = cb.paste(mime_atom)         catch return;
+            cmn.writeAll(client, data) catch |err| {
                 std.log.err("Failed to send data to client: {}", .{err});
                 return;
             };
@@ -117,8 +117,15 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
                 };
             }
             defer if (header.data_len == 0) allocator.free(data);
-            std.debug.print("{s}", .{data});
-            // TODO: ...
+
+            const mime_atom = cb.atoms.get(mime) catch |err| {
+                std.log.err("Failed to save client data (mime): {}", .{err});
+                return;
+            };
+            cb.copy(mime_atom, data) catch |err| {
+                std.log.err("Failed to save client data: {}", .{err});
+                return;
+            };
         },
     }
 }

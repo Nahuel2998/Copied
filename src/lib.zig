@@ -88,6 +88,15 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
     };
 }
 
+pub fn paste(self: Self, mime: c.xcb_atom_t) ![]const u8 {
+    if (self.clipboard) |cb| {
+        _ = mime;
+        // TODO: mime check
+        return cb.data;
+    }
+    return error.NoData;
+}
+
 pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
     return c.xcb_get_file_descriptor(self.conn);
 }
@@ -127,8 +136,13 @@ const AtomStash = struct {
         self.* = undefined;
     }
 
+    pub fn getNoIntern(self: AtomStash, name: []const u8) ?c.xcb_atom_t {
+        if (name.len == 0) return c.XCB_ATOM_ANY;
+        return self.cache.get(name);
+    }
+
     pub fn get(self: *AtomStash, name: []const u8) !c.xcb_atom_t {
-        if (self.cache.get(name)) |atom| return atom;
+        if (self.getNoIntern(name)) |atom| return atom;
 
         const res = try self.intern(1, .{ name });
         return res[0];
