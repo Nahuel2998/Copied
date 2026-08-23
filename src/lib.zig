@@ -273,24 +273,28 @@ const ClipboardData = struct {
     }
 
     pub fn saveCopy(self: *ClipboardData, mime: c.xcb_atom_t, data: []const u8) ![]const u8 {
-        if (self.offers_len >= MAX_OFFERS) return error.NoMemory;
-
         const data_owned = try self.arena.allocator().dupe(u8, data);
-        self.insert(mime, data_owned);
-
+        self.saveAlias(mime, data_owned) catch {
+            self.arena.allocator().free(data_owned);
+        };
         return data_owned;
     }
 
     pub fn saveAlias(self: *ClipboardData, mime: c.xcb_atom_t, data: []const u8) !void {
-        if (self.offers_len >= MAX_OFFERS) return error.NoMemory;
+        var idx = self.offers_len;
+        for (self.mime[0..self.offers_len], 0..) |existing, i| {
+            if (existing == mime) {
+                idx = i;
+            }
+        }
 
-        self.insert(mime, data);
-    }
+        if (idx == self.offers_len) {
+            if (self.offers_len >= MAX_OFFERS) return error.NoMemory;
+            self.offers_len += 1;
+        }
 
-    inline fn insert(self: *ClipboardData, mime: c.xcb_atom_t, data: []const u8) void {
-        self.mime[self.offers_len] = mime;
-        self.data[self.offers_len] = data;
-        self.offers_len += 1;
+        self.mime[idx] = mime;
+        self.data[idx] = data;
     }
 
     pub fn reset(self: *ClipboardData) void {
