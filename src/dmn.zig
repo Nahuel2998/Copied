@@ -94,8 +94,8 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
 
     switch (header.mode) {
         .read => {
-            const mime_atom = cb.atoms.getNoIntern(mime) orelse return;
-            const data      = cb.paste(mime_atom)         catch return;
+            const mime_atom = if (mime.len == 0) null else cb.atoms.getNoIntern(mime) orelse return;
+            const data      = cb.paste(mime_atom) orelse return;
             cmn.writeAll(client, data) catch |err| {
                 std.log.err("Failed to send data to client: {}", .{err});
                 return;
@@ -118,7 +118,8 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
             }
             defer if (header.data_len == 0) allocator.free(data);
 
-            const mime_atom = cb.atoms.get(mime) catch |err| {
+            const mime_str  = if (mime.len != 0) mime else "UTF8_STRING";
+            const mime_atom = cb.atoms.get(mime_str) catch |err| {
                 std.log.err("Failed to save client data (mime): {}", .{err});
                 return;
             };

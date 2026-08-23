@@ -8,10 +8,7 @@ screen: *c.xcb_screen_t,
 window:  c.xcb_window_t,
 
 atoms:     AtomStash,
-clipboard: ?struct {
-    mime: c.xcb_atom_t,
-    data: []const u8,
-} = null,
+clipboard: ClipboardData,
 
 allocator: std.mem.Allocator,
 
@@ -65,36 +62,25 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .screen = screen,
         .window = window,
         .atoms  = atoms,
+        .clipboard = .init(allocator),
         .allocator = allocator,
     };
 }
 
 pub fn deinit(self: *Self) void {
     self.atoms.deinit();
-    if (self.clipboard) |cb| {
-        self.allocator.free(cb.data);
-    }
+    self.clipboard.deinit();
     c.xcb_disconnect(self.conn);
     self.* = undefined;
 }
 
 pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
-    if (self.clipboard) |cb| {
-        self.allocator.free(cb.data);
-    }
-    self.clipboard = .{
-        .mime = mime,
-        .data = try self.allocator.dupe(u8, data),
-    };
+    self.clipboard.reset();
+    _ = try self.clipboard.saveCopy(mime, data);
 }
 
-pub fn paste(self: Self, mime: c.xcb_atom_t) ![]const u8 {
-    if (self.clipboard) |cb| {
-        _ = mime;
-        // TODO: mime check
-        return cb.data;
-    }
-    return error.NoData;
+pub fn paste(self: Self, mime: ?c.xcb_atom_t) ?[]const u8 {
+    return self.clipboard.get(mime);
 }
 
 pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
@@ -137,7 +123,6 @@ const AtomStash = struct {
     }
 
     pub fn getNoIntern(self: AtomStash, name: []const u8) ?c.xcb_atom_t {
-        if (name.len == 0) return c.XCB_ATOM_ANY;
         return self.cache.get(name);
     }
 
@@ -254,6 +239,68 @@ const AtomStash = struct {
         const primary_name = try atoms.getName(c.XCB_ATOM_PRIMARY);
         const primary_atom = try atoms.get(primary_name);
         try std.testing.expect(primary_atom == c.XCB_ATOM_PRIMARY);
+    }
+};
+
+const ClipboardData = struct {
+    const MAX_OFFERS = 32;
+
+    mime: [MAX_OFFERS]c.xcb_atom_t = undefined,
+    data: [MAX_OFFERS][]const u8   = undefined,
+
+    offers_len: usize = 0,
+    arena: std.heap.ArenaAllocator,
+
+    pub fn init(allocator: std.mem.Allocator) ClipboardData {
+        return .{
+            .arena = .init(allocator),
+        };
+    }
+
+    pub fn get(self: ClipboardData, mime: ?c.xcb_atom_t) ?[]const u8 {
+        if (self.offers_len == 0) return null;
+
+        if (mime == null) {
+            return self.data[0];
+        }
+
+        for (0..self.offers_len) |i| {
+            if (self.mime[i] == mime) {
+                return self.data[i];
+            }
+        }
+        return null;
+    }
+
+    pub fn saveCopy(self: *ClipboardData, mime: c.xcb_atom_t, data: []const u8) ![]const u8 {
+        if (self.offers_len >= MAX_OFFERS) return error.NoMemory;
+
+        const data_owned = try self.arena.allocator().dupe(u8, data);
+        self.insert(mime, data_owned);
+
+        return data_owned;
+    }
+
+    pub fn saveAlias(self: *ClipboardData, mime: c.xcb_atom_t, data: []const u8) !void {
+        if (self.offers_len >= MAX_OFFERS) return error.NoMemory;
+
+        self.insert(mime, data);
+    }
+
+    inline fn insert(self: *ClipboardData, mime: c.xcb_atom_t, data: []const u8) void {
+        self.mime[self.offers_len] = mime;
+        self.data[self.offers_len] = data;
+        self.offers_len += 1;
+    }
+
+    pub fn reset(self: *ClipboardData) void {
+        _ = self.arena.reset(.retain_capacity);
+        self.offers_len = 0;
+    }
+
+    pub fn deinit(self: *ClipboardData) void {
+        self.arena.deinit();
+        self.* = undefined;
     }
 };
 
