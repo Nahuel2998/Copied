@@ -67,8 +67,8 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
     const client: linux.fd_t = @intCast(cmn.call( linux.accept(sock, null, null) ) orelse return);
     defer _ = linux.close(client);
 
-    var buf:      [4096]u8 = undefined;
-    var reader: cmn.Reader = .{ .fd = client, .read_buf = &buf };
+    var buf: [cmn.BUF_SIZE]u8 = undefined;
+    var reader:    cmn.Reader = .{ .fd = client, .read_buf = &buf };
 
     // |mode (0 => read; 1 => write)
     // |x|mime_len
@@ -95,7 +95,11 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
 
     switch (header.mode) {
         .read => {
-            // TODO: ...
+            // TODO: Send the actual reply
+            cmn.writeAll(client, "hola :)\n") catch |err| {
+                std.log.err("Failed to send data to client: {}", .{err});
+                return;
+            };
         },
         .write => {
             var data: []u8 = undefined;
@@ -113,6 +117,7 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
                 };
             }
             defer if (header.data_len == 0) allocator.free(data);
+            std.debug.print("{s}", .{data});
             // TODO: ...
         },
     }
@@ -125,6 +130,7 @@ fn createSock(path: [108]u8, path_len: usize) !linux.fd_t {
     const addr: std.posix.sockaddr.un = .{ .path = path };
     const addr_len: u32 = @intCast( @offsetOf(std.posix.sockaddr.un, "path") + path_len + 1 );
 
+    _ = linux.unlink(path[0..path_len:0]);
     _ = cmn.call( linux.bind(sock, @ptrCast(&addr), addr_len) ) orelse return error.NoBind;
     _ = cmn.call( linux.listen(sock, 1) )                       orelse return error.NoListen;
     return sock;

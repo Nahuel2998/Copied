@@ -1,19 +1,20 @@
 const std   = @import("std");
 const linux = std.os.linux;
 
-const SOCK_NAME = "/copied.sock";
+pub const SOCK_NAME = "/copied.sock";
+pub const BUF_SIZE  = 32 * 1024;
 
 pub const CopyMode = enum { read, write };
 pub const Header = struct {
-    mode:  CopyMode,
-    mime_len: usize,
-    data_len: usize,
+    mode: CopyMode,
+    mime_len: usize = 0,
+    data_len: usize = 0,
 
     pub fn serialize(self: Header) [7]u8 {
-        const res: [7]u8 = undefined;
+        var res: [7]u8 = undefined;
         res[0] = @intFromEnum(self.mode);
-        std.mem.writeInt(u16, &res[1..3], self.mime_len, .little);
-        std.mem.writeInt(u32, &res[3..7], self.data_len, .little);
+        std.mem.writeInt(u16, res[1..3], @intCast(self.mime_len), .little);
+        std.mem.writeInt(u32, res[3..7], @intCast(self.data_len), .little);
         return res;
     }
 
@@ -74,7 +75,7 @@ pub const Reader = struct {
         return res.toOwnedSlice(allocator);
     }
 
-    fn read(self: *Reader, count: usize) ![]u8 {
+    pub fn read(self: *Reader, count: usize) ![]u8 {
         if (self.seek_i >= self.read_i) try self.readFd();
 
         const from = self.seek_i;
@@ -91,7 +92,7 @@ pub const Reader = struct {
             const buf = self.read_buf[self.read_i..self.read_buf.len];
 
             const read_res = linux.read(self.fd, buf.ptr, buf.len);
-            switch (std.posix.errno(read_res)) {
+            switch (linux.errno(read_res)) {
                 .SUCCESS => {
                     if (read_res == 0) {
                         self.eof = true;
@@ -118,7 +119,7 @@ pub fn writeAll(fd: linux.fd_t, bytes: []const u8) !void {
     while (i < bytes.len) {
         const buf = bytes[i..];
         const write_res = linux.write(fd, buf.ptr, buf.len);
-        switch (std.posix.errno(write_res)) {
+        switch (linux.errno(write_res)) {
             .SUCCESS => i += write_res,
             .INTR    => continue,
             else     => return error.NoWrite,
@@ -127,6 +128,6 @@ pub fn writeAll(fd: linux.fd_t, bytes: []const u8) !void {
 }
 
 pub fn call(res: usize) ?usize {
-    if (std.posix.errno(res) != .SUCCESS) return null;
+    if (linux.errno(res) != .SUCCESS) return null;
     return res;
 }

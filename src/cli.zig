@@ -45,6 +45,7 @@ fn run(init: std.process.Init) !void {
                 try log(io, "usage(arg): -t <mime_type>");
                 return error.InvalidArgument;
             };
+            continue;
         }
 
         if (source != .none) {
@@ -53,7 +54,6 @@ fn run(init: std.process.Init) !void {
         }
         source = .{ .filename = arg };
     }
-    std.debug.print("{s}\n", .{mime});
 
     const run_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse {
         try log(io, "error: XDG_RUNTIME_DIR isn't set");
@@ -69,6 +69,83 @@ fn run(init: std.process.Init) !void {
         return error.Expected;
     };
     defer _ = linux.close(sock);
+
+    if (source == .none) {
+        try modeRead(io, sock, mime);
+    }
+    else {
+        try modeWrite(io, sock, mime, source);
+    }
+}
+
+fn modeRead(io: std.Io, sock: linux.fd_t, mime: []const u8) !void {
+    const header: cmn.Header = .{
+        .mode     = .read,
+        .mime_len = mime.len,
+    };
+    const header_data = header.serialize();
+    try cmn.writeAll(sock, &header_data);
+
+    if (mime.len > 0) {
+        try cmn.writeAll(sock, mime);
+    }
+    _ = cmn.call( linux.shutdown(sock, linux.SHUT.WR) ) orelse return error.NoShutdown;
+
+    var buf: [cmn.BUF_SIZE]u8 = undefined;
+    var reader: cmn.Reader = .{ .fd = sock, .read_buf = &buf };
+    while (true) {
+        const recv = reader.read(buf.len) catch |err| switch (err) {
+            error.NoMore => break,
+            else         => return err,
+        };
+        try stdout.writeStreamingAll(io, recv);
+    }
+}
+
+fn modeWrite(io: std.Io, sock: linux.fd_t, mime: []const u8, source: Source) !void {
+    var data_len: usize = 0;
+    var file = stdin;
+    switch (source) {
+        .filename => |filepath| {
+            file = try std.Io.Dir.cwd().openFile(io, filepath, .{});
+
+            const stat = try file.stat(io);
+            data_len = stat.size;
+        },
+        .stdin => {},
+        .none  => unreachable,
+    }
+    defer file.close(io);
+
+    const header: cmn.Header = .{
+        .mode     = .write,
+        .mime_len = mime.len,
+        .data_len = data_len,
+    };
+    const header_data = header.serialize();
+    try cmn.writeAll(sock, &header_data);
+
+    if (mime.len > 0) {
+        try cmn.writeAll(sock, mime);
+    }
+
+    var buf: [cmn.BUF_SIZE]u8 = undefined;
+    while (true) {
+        const send = try readFileChunk(io, file, &buf);
+        try cmn.writeAll(sock, send);
+        if (send.len < buf.len) break;
+    }
+}
+
+fn readFileChunk(io: std.Io, file: std.Io.File, buf: []u8) ![]u8 {
+    var i: usize = 0;
+    while (true) {
+        i += file.readStreaming(io, &.{buf[i..]}) catch |err| switch (err) {
+            error.EndOfStream => return buf[0..i],
+            else              => return err,
+        };
+        if (i == buf.len) return buf;
+    }
 }
 
 fn log(io: std.Io, comptime message: []const u8) !void {
