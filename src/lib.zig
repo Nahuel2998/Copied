@@ -3,6 +3,9 @@ const c   = @import("xcb");
 
 const Self = @This();
 
+const RECV_PROPERTY = "_COPIED_RECV";
+const SELECTION     = "CLIPBOARD";
+
 conn:   *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
 window:  c.xcb_window_t,
@@ -11,6 +14,10 @@ atoms:     AtomStash,
 clipboard: ClipboardData,
 
 allocator: std.mem.Allocator,
+
+xfixes_base: u8,
+last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
+selection_is_mine: bool = false,
 
 fn xcbConnect(pref_screen: ?*c_int) ?*c.xcb_connection_t {
     const conn = c.xcb_connect(null, pref_screen) orelse return null;
@@ -54,22 +61,29 @@ fn initWindow(conn: *c.xcb_connection_t, screen: *c.xcb_screen_t) !u32 {
 
 fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash {
     var atoms: AtomStash = .init(conn, allocator);
-    const common_atoms = [_][]const u8{"CLIPBOARD", "TIMESTAMP", "TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list"};
+    const common_atoms = [_][]const u8{RECV_PROPERTY, SELECTION, "TIMESTAMP", "TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list", "text/html", "image/png"};
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
 
-fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !void {
+extern var xcb_xfixes_id: anyopaque; // HACK: Workaround for translate-c not translating opaques
+
+fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
+    const xfixes = c.xcb_get_extension_data(conn, @ptrCast(&xcb_xfixes_id)) orelse return error.NoXFixes;
+    if (xfixes.*.present == 0) return error.NoXFixes;
+
     const cookie = c.xcb_xfixes_query_version(conn, c.XCB_XFIXES_MAJOR_VERSION, c.XCB_XFIXES_MINOR_VERSION);
 
     const evmask = c.XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER
                  | c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY
                  | c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE;
-    const selection = atoms.getNoIntern("CLIPBOARD").?;
+    const selection = atoms.getNoIntern(SELECTION).?;
     _ = c.xcb_xfixes_select_selection_input(conn, window, selection, evmask);
 
     const reply = c.xcb_xfixes_query_version_reply(conn, cookie, null) orelse return error.NoXFixes;
     std.c.free(reply);
+
+    return xfixes.*.first_event;
 }
 
 pub fn init(allocator: std.mem.Allocator) !Self {
@@ -80,7 +94,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const window = try initWindow(conn, screen);
     const atoms  = try initAtoms(conn, allocator);
 
-    try initXFixes(conn, window, atoms);
+    const xfixes_base = try initXFixes(conn, window, atoms);
     _ = c.xcb_flush(conn);
 
     return .{
@@ -90,6 +104,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .atoms  = atoms,
         .clipboard = .init(allocator),
         .allocator = allocator,
+        .xfixes_base = xfixes_base,
     };
 }
 
@@ -105,8 +120,14 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
     _ = try self.clipboard.saveCopy(mime, data);
 }
 
-pub fn paste(self: Self, mime: ?c.xcb_atom_t) ?[]const u8 {
-    return self.clipboard.get(mime);
+pub fn paste(self: *Self, mime: ?c.xcb_atom_t) ?[]const u8 {
+    if (self.clipboard.get(mime)) |res| return res;
+    if (self.selection_is_mine)         return null;
+    // FIXME: Temporary UTF8_STRING default
+    return self.retrieveSelection(mime orelse self.atoms.getNoIntern("UTF8_STRING").?) catch |err| {
+        std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
+        return null;
+    };
 }
 
 pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
@@ -120,9 +141,83 @@ pub fn drainXEvents(self: *Self) void {
     }
 }
 
+fn waitForEvent(self: *Self, target_evtype: u8) !*c.xcb_generic_event_t {
+    const POLL_TIMEOUT = 100;
+    const POLL_TIMES   = 5;
+
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = self.getXFileDescriptor(), .events = std.posix.POLL.IN, .revents = 0 },
+    };
+
+    for (0..POLL_TIMES) |_| {
+        while (c.xcb_poll_for_event(self.conn)) |event| {
+            const evtype = event.*.response_type & 0x7f;
+            if (evtype == target_evtype) {
+                return event;
+            }
+            defer std.c.free(event);
+            self.handleXEvent(event);
+        }
+        _ = try std.posix.poll(&fds, POLL_TIMEOUT);
+    }
+    return error.PollTimeout;
+}
+
 fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
-    _ = self;
-    _ = event;
+    const evtype = event.response_type & 0x7f;
+    switch (evtype) {
+        c.XCB_SELECTION_NOTIFY => {
+            std.log.warn("Received dangling SelectionNotify, handling anyways", .{});
+            _ = self.handleSelectionNotify(@ptrCast(event)) catch |err| {
+                std.log.err("Unexpected error handling SelectionNotify: {}\n", .{err});
+            };
+        },
+        c.XCB_PROPERTY_NOTIFY => {
+            const ev: *c.xcb_property_notify_event_t = @ptrCast(event);
+            self.last_event_time = ev.time;
+        },
+        else => {},
+    }
+}
+
+fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]const u8 {
+    self.last_event_time = ev.time;
+
+    if (ev.property == c.XCB_ATOM_NONE) {
+        std.log.debug("Selection owner rejected the request", .{});
+        return null; // :(
+    }
+
+    const cookie = c.xcb_get_property(self.conn, 1, self.window, ev.property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
+    const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
+    defer std.c.free(reply);
+
+    if (reply.*.type == self.atoms.getNoIntern("INCR").?) {
+        // TODO: Handle INCR
+        return error.NotSupported;
+    }
+
+    const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
+    const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
+
+    if (reply.*.bytes_after > 0) {
+        // FIXME: Probably keep reading rather than just failing
+        return error.NotTheEntireOwl;
+    }
+
+    return try self.clipboard.saveCopy(reply.*.type, value[0..length]);
+}
+
+fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
+    const selection = self.atoms.getNoIntern(SELECTION).?;
+    const property  = self.atoms.getNoIntern(RECV_PROPERTY).?;
+    _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, property, self.last_event_time);
+    _ = c.xcb_flush(self.conn);
+
+    const ev = try self.waitForEvent(c.XCB_SELECTION_NOTIFY);
+    defer std.c.free(ev);
+
+    return self.handleSelectionNotify(@ptrCast(ev));
 }
 
 const AtomStash = struct {
