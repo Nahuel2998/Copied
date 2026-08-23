@@ -21,22 +21,19 @@ fn xcbConnect(pref_screen: ?*c_int) ?*c.xcb_connection_t {
     return conn;
 }
 
-pub fn init(allocator: std.mem.Allocator) !Self {
-    var pref_screen: c_int = undefined;
-    const conn = xcbConnect(&pref_screen) orelse return error.NoDisplay;
+fn getScreen(conn: *c.xcb_connection_t, num: c_int) !*c.xcb_screen_t {
+    const setup = c.xcb_get_setup(conn);
+    var   iter  = c.xcb_setup_roots_iterator(setup);
+    for (0..@intCast(num)) |_| {
+        if (iter.rem == 0) return error.NoScreen;
+        c.xcb_screen_next(&iter);
+    }
+    return iter.data;
+}
 
-    const screen: *c.xcb_screen_t = blk: {
-        const setup = c.xcb_get_setup(conn);
-        var   iter  = c.xcb_setup_roots_iterator(setup);
-        for (0..@intCast(pref_screen)) |_| {
-            if (iter.rem == 0) return error.NoScreen;
-            c.xcb_screen_next(&iter);
-        }
-        break :blk iter.data;
-    };
-
-    const evmask = c.XCB_EVENT_MASK_PROPERTY_CHANGE;
+fn initWindow(conn: *c.xcb_connection_t, screen: *c.xcb_screen_t) !u32 {
     const window = c.xcb_generate_id(conn);
+    const evmask = c.XCB_EVENT_MASK_PROPERTY_CHANGE;
     const cookie = c.xcb_create_window_checked(
         conn,
         c.XCB_COPY_FROM_PARENT,
@@ -52,10 +49,39 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         std.c.free(err);
         return error.NoWindow;
     }
+    return window;
+}
 
+fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash {
     var atoms: AtomStash = .init(conn, allocator);
-    const common_atoms = [_][]const u8{"TIMESTAMP", "TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list"};
+    const common_atoms = [_][]const u8{"CLIPBOARD", "TIMESTAMP", "TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list"};
     _ = try atoms.intern(common_atoms.len, common_atoms);
+    return atoms;
+}
+
+fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !void {
+    const cookie = c.xcb_xfixes_query_version(conn, c.XCB_XFIXES_MAJOR_VERSION, c.XCB_XFIXES_MINOR_VERSION);
+
+    const evmask = c.XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER
+                 | c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY
+                 | c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE;
+    const selection = atoms.getNoIntern("CLIPBOARD").?;
+    _ = c.xcb_xfixes_select_selection_input(conn, window, selection, evmask);
+
+    const reply = c.xcb_xfixes_query_version_reply(conn, cookie, null) orelse return error.NoXFixes;
+    std.c.free(reply);
+}
+
+pub fn init(allocator: std.mem.Allocator) !Self {
+    var pref_screen: c_int = undefined;
+    const conn = xcbConnect(&pref_screen) orelse return error.NoDisplay;
+
+    const screen = try getScreen(conn, pref_screen);
+    const window = try initWindow(conn, screen);
+    const atoms  = try initAtoms(conn, allocator);
+
+    try initXFixes(conn, window, atoms);
+    _ = c.xcb_flush(conn);
 
     return .{
         .conn   = conn,

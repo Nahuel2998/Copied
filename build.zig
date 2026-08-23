@@ -33,6 +33,7 @@ fn buildXcb(ctx: BuildContext) *std.Build.Module {
         .optimize         = ctx.optimize,
     });
     xcb.linkSystemLibrary("xcb", .{});
+    xcb.linkSystemLibrary("xcb-xfixes", .{});
 
     return xcb.createModule();
 }
