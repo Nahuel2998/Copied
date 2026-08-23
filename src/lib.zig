@@ -142,8 +142,9 @@ pub fn drainXEvents(self: *Self) void {
 }
 
 fn waitForEvent(self: *Self, target_evtype: u8) !*c.xcb_generic_event_t {
-    const POLL_TIMEOUT = 100;
-    const POLL_TIMES   = 5;
+    // FIXME: Well I don't know what to do if you're just slow, ~5s seems plenty
+    const POLL_TIMEOUT = 500;
+    const POLL_TIMES   = 10;
 
     var fds = [_]std.posix.pollfd{
         .{ .fd = self.getXFileDescriptor(), .events = std.posix.POLL.IN, .revents = 0 },
@@ -188,24 +189,66 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
         return null; // :(
     }
 
-    const cookie = c.xcb_get_property(self.conn, 1, self.window, ev.property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
-    const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
+    const reply = try self.xcbGetProperty(ev.property);
     defer std.c.free(reply);
-
-    if (reply.*.type == self.atoms.getNoIntern("INCR").?) {
-        // TODO: Handle INCR
-        return error.NotSupported;
-    }
 
     const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
     const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
 
+    var mime = reply.*.type;
+    var data = value[0..length];
+    const is_incr = reply.*.type == self.atoms.getNoIntern("INCR").?;
+    if (is_incr) {
+        var init_capacity: usize = 0;
+        if (length == 4) {
+            init_capacity = std.mem.readInt(u32, value[0..4], .native);
+        }
+
+        const res = try self.receiveIncr(ev.property, init_capacity);
+        mime = res.mime;
+        data = res.data;
+    }
+    defer if (is_incr) self.allocator.free(data);
+
+    return try self.clipboard.saveCopy(mime, data);
+}
+
+fn xcbGetProperty(self: *Self, property: c.xcb_atom_t) !*c.xcb_get_property_reply_t {
+    const cookie = c.xcb_get_property(self.conn, 1, self.window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
+    const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
     if (reply.*.bytes_after > 0) {
-        // FIXME: Probably keep reading rather than just failing
+        // FIXME: Probably keep reading rather than just failing?
         return error.NotTheEntireOwl;
     }
+    return reply;
+}
 
-    return try self.clipboard.saveCopy(reply.*.type, value[0..length]);
+fn receiveIncr(self: *Self, property: c.xcb_atom_t, init_capacity: usize) !struct{ mime: c.xcb_atom_t, data: []const u8 } {
+    var buf: std.ArrayList(u8) = try .initCapacity(self.allocator, init_capacity);
+    errdefer buf.deinit(self.allocator);
+
+    while (true) {
+        const event = try self.waitForEvent(c.XCB_PROPERTY_NOTIFY);
+        defer std.c.free(event);
+        self.handleXEvent(event);
+
+        const ev: *c.xcb_property_notify_event_t = @ptrCast(event);
+        if (ev.atom != property or ev.state != c.XCB_PROPERTY_NEW_VALUE) {
+            continue;
+        }
+
+        const reply = try self.xcbGetProperty(property);
+        defer std.c.free(reply);
+
+        const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
+        const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
+
+        if (length == 0) return .{
+            .mime = reply.*.type,
+            .data = try buf.toOwnedSlice(self.allocator),
+        };
+        try buf.appendSlice(self.allocator, value[0..length]);
+    }
 }
 
 fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
@@ -224,10 +267,7 @@ pub fn translateTargetsList(self: *Self, data: []const u8, buf: []u8) ![]const u
     var i: usize = 0;
     var targets_atoms: [ClipboardData.MAX_OFFERS]c.xcb_atom_t = undefined;
     while (i + 4 <= data.len) : (i += 4) {
-        var atom_data: [4]u8 = undefined;
-        @memcpy(&atom_data, data[i..(i + 4)]);
-
-        const atom = std.mem.readInt(c.xcb_atom_t, &atom_data, .native);
+        const atom = std.mem.readInt(c.xcb_atom_t, data[i..][0..4], .native);
         targets_atoms[i / 4] = atom;
     }
 
