@@ -95,7 +95,14 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
     switch (header.mode) {
         .read => {
             const mime_atom = if (mime.len == 0) null else cb.atoms.get(mime) catch return;
-            const data      = cb.paste(mime_atom) orelse return;
+            var   data      = cb.paste(mime_atom) orelse return;
+            if (mime_atom == cb.atoms.getNoIntern("TARGETS").?) {
+                var targets_buf: [1024]u8 = undefined;
+                data = cb.translateTargetsList(data, &targets_buf) catch |err| {
+                    std.log.err("Failed to get atom names building TARGETS response: {}", .{err});
+                    return;
+                };
+            }
             cmn.writeAll(client, data) catch |err| {
                 std.log.err("Failed to send data to client: {}", .{err});
                 return;

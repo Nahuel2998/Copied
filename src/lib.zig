@@ -220,6 +220,29 @@ fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
     return self.handleSelectionNotify(@ptrCast(ev));
 }
 
+pub fn translateTargetsList(self: *Self, data: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    var targets_atoms: [ClipboardData.MAX_OFFERS]c.xcb_atom_t = undefined;
+    while (i + 4 <= data.len) : (i += 4) {
+        var atom_data: [4]u8 = undefined;
+        @memcpy(&atom_data, data[i..(i + 4)]);
+
+        const atom = std.mem.readInt(c.xcb_atom_t, &atom_data, .native);
+        targets_atoms[i / 4] = atom;
+    }
+
+    const targets_len = data.len / 4;
+    var targets_names: [ClipboardData.MAX_OFFERS][]const u8 = undefined;
+    try self.atoms.getNames(targets_atoms[0..targets_len], targets_names[0..targets_len]);
+
+    var targets: std.ArrayList(u8) = .initBuffer(buf);
+    for (targets_names[0..targets_len]) |name| {
+        try targets.appendSliceBounded(name);
+        try targets.appendBounded('\n');
+    }
+    return targets.items;
+}
+
 const AtomStash = struct {
     conn:        *c.xcb_connection_t,
     allocator:   std.mem.Allocator,
