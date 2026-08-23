@@ -66,10 +66,10 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
     return atoms;
 }
 
-extern var xcb_xfixes_id: anyopaque; // HACK: Workaround for translate-c not translating opaques
+extern var xcb_xfixes_id: c.xcb_extension_t; // Why doesn't translate-c do this?
 
 fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
-    const xfixes = c.xcb_get_extension_data(conn, @ptrCast(&xcb_xfixes_id)) orelse return error.NoXFixes;
+    const xfixes = c.xcb_get_extension_data(conn, &xcb_xfixes_id) orelse return error.NoXFixes;
     if (xfixes.*.present == 0) return error.NoXFixes;
 
     const cookie = c.xcb_xfixes_query_version(conn, c.XCB_XFIXES_MAJOR_VERSION, c.XCB_XFIXES_MINOR_VERSION);
