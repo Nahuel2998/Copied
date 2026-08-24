@@ -105,7 +105,8 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const atoms  = try initAtoms(conn, allocator);
 
     const xfixes_base         = try initXFixes(conn, window, atoms);
-    const max_transfer: usize = @min(MAX_TRANSFER_CAP, @as(usize, c.xcb_get_maximum_request_length(conn)) * 4 - 100);
+    const max_request_len     = c.xcb_get_maximum_request_length(conn);
+    const max_transfer: usize = @min(MAX_TRANSFER_CAP, @as(usize, max_request_len) * 4 - 100);
     _ = c.xcb_flush(conn);
 
     return .{
@@ -238,7 +239,7 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
         return null;
     }
 
-    const reply = try self.xcbGetProperty(ev.property);
+    const reply = try self.getProperty(ev.property);
     defer std.c.free(reply);
 
     const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
@@ -262,7 +263,7 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
     return try self.clipboard.saveCopy(mime, data);
 }
 
-fn xcbGetProperty(self: *Self, property: c.xcb_atom_t) !*c.xcb_get_property_reply_t {
+fn getProperty(self: *Self, property: c.xcb_atom_t) !*c.xcb_get_property_reply_t {
     const cookie = c.xcb_get_property(self.conn, 1, self.window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
     const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
     if (reply.*.bytes_after > 0) {
@@ -286,7 +287,7 @@ fn receiveIncr(self: *Self, property: c.xcb_atom_t, init_capacity: usize) !struc
             continue;
         }
 
-        const reply = try self.xcbGetProperty(property);
+        const reply = try self.getProperty(property);
         defer std.c.free(reply);
 
         const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
@@ -320,12 +321,22 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
 
         if (ev.selection != self.atoms.getNoIntern(SELECTION).?) break :blk false;
 
-        const data = self.clipboard.get(ev.target) orelse break :blk false;
+        var data: []const u8 = undefined;
+        if (ev.target == self.atoms.getNoIntern("TARGETS").?) {
+            data = self.getTargetsList() catch |err| {
+                std.log.err("Couldn't respond to TARGETS due to: {}", .{err});
+                break :blk false;
+            };
+        }
+        else {
+            data = self.clipboard.get(ev.target) orelse break :blk false;
+        }
+
         if (data.len > self.max_transfer) {
             // const data_owned = try std.allocator.dupe(u8, data);
             // defer self.allocator.free(data);
             // self.sendIncr(ev.requestor, property, ev.target, data_owned) catch |err| {
-            //     self.log.err("INCR transfer failed: {}", .{err});
+            //     std.log.err("INCR transfer failed: {}", .{err});
             //     break :blk false;
             // };
             // break :blk true;
@@ -383,8 +394,8 @@ fn getTargetsList(self: *Self) ![]const u8 {
     const len = self.clipboard.offers_len;
     if (len >= ClipboardData.MAX_OFFERS) return error.NoMemory;
 
-    self.clipboard.mime[len] = self.clipboard.mime[self.atoms.getNoIntern("TARGETS").?];
-    return self.clipboard.mime[0..(len + 1)];
+    self.clipboard.mime[len] = self.atoms.getNoIntern("TARGETS").?;
+    return std.mem.sliceAsBytes(self.clipboard.mime[0..(len + 1)]);
 }
 
 const AtomStash = struct {
