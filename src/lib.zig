@@ -3,6 +3,12 @@ const c   = @import("xcb");
 
 const Self = @This();
 
+// We're copying Emacs on this one
+// Chromium seems to be more conservative (0x100000) and other clipboard managers even more so (xsel using 4000)
+// From my tests, Emacs seems to follow the protocol very closely
+// It was also last modified in 1994 so it can't be that incompatible with old clients/servers...
+const MAX_TRANSFER_CAP = 0xFFFFFF;
+
 const RECV_PROPERTY = "_COPIED_RECV";
 const SELECTION     = "CLIPBOARD";
 
@@ -16,6 +22,8 @@ clipboard: ClipboardData,
 allocator: std.mem.Allocator,
 
 xfixes_base: u8,
+max_transfer: usize,
+
 last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
 selection_is_mine: bool = false,
 
@@ -94,7 +102,8 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const window = try initWindow(conn, screen);
     const atoms  = try initAtoms(conn, allocator);
 
-    const xfixes_base = try initXFixes(conn, window, atoms);
+    const xfixes_base         = try initXFixes(conn, window, atoms);
+    const max_transfer: usize = @min(MAX_TRANSFER_CAP, @as(usize, c.xcb_get_maximum_request_length(conn)) * 4 - 100);
     _ = c.xcb_flush(conn);
 
     return .{
@@ -105,6 +114,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .clipboard = .init(allocator),
         .allocator = allocator,
         .xfixes_base = xfixes_base,
+        .max_transfer = max_transfer,
     };
 }
 
@@ -167,6 +177,9 @@ fn waitForEvent(self: *Self, target_evtype: u8) !*c.xcb_generic_event_t {
 fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
     const evtype = event.response_type & 0x7f;
     switch (evtype) {
+        c.XCB_SELECTION_REQUEST => {
+            self.handleSelectionRequest(@ptrCast(event));
+        },
         c.XCB_SELECTION_NOTIFY => {
             std.log.warn("Received dangling SelectionNotify, handling anyways", .{});
             _ = self.handleSelectionNotify(@ptrCast(event)) catch |err| {
@@ -185,8 +198,8 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
     self.last_event_time = ev.time;
 
     if (ev.property == c.XCB_ATOM_NONE) {
-        std.log.debug("Selection owner rejected the request", .{});
-        return null; // :(
+        std.log.debug("Selection owner rejected the request :(", .{});
+        return null;
     }
 
     const reply = try self.xcbGetProperty(ev.property);
@@ -251,6 +264,50 @@ fn receiveIncr(self: *Self, property: c.xcb_atom_t, init_capacity: usize) !struc
     }
 }
 
+fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) void {
+    self.last_event_time = ev.time;
+
+    const property = if (ev.property != c.XCB_ATOM_NONE) ev.property else ev.target;
+    var notify: c.xcb_selection_notify_event_t = .{
+        .response_type = c.XCB_SELECTION_NOTIFY,
+        .time          = ev.time,
+        .requestor     = ev.requestor,
+        .selection     = ev.selection,
+        .target        = ev.target,
+        .property      = property,
+    };
+
+    const handled = blk: {
+        // Rather than comparing timestamp:
+        // If we're no longer the owners, then we already cleared our data so we have nothing valid to send
+        if (!self.selection_is_mine) break :blk false;
+
+        if (ev.selection != self.atoms.getNoIntern(SELECTION).?) break :blk false;
+
+        const data = self.clipboard.get(ev.target) orelse break :blk false;
+        if (data.len > self.max_transfer) {
+            // self.sendIncr(ev.requestor, property, ev.target, data_owned) catch |err| {
+            //     self.log.err("INCR transfer failed: {}", .{err});
+            //     break :blk false;
+            // };
+            // break :blk true;
+            std.log.err("INCR not yet supported, rejecting", .{});
+            break :blk false;
+        }
+        _ = c.xcb_change_property(self.conn, c.XCB_PROP_MODE_REPLACE, ev.requestor, property, ev.target, 8, @intCast(data.len), data.ptr);
+        break :blk true;
+    };
+    if (!handled) {
+        notify.property = c.XCB_ATOM_NONE;
+    }
+    _ = c.xcb_send_event(self.conn, 0, ev.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
+}
+
+// fn sendIncr(self: *Self, requestor: c.xcb_window_t, property: c.xcb_atom_t, mime: c.xcb_atom_t, data: []const u8) !void {
+//     const data_len: u32 = @min(data.len, std.math.maxInt(u32));
+//     _ = c.xcb_change_property(self.conn, c.XCB_PROP_MODE_REPLACE, requestor, property, self.atoms.getNoIntern("INCR").?, 32, 2, &data_len);
+// }
+
 fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
     const selection = self.atoms.getNoIntern(SELECTION).?;
     const property  = self.atoms.getNoIntern(RECV_PROPERTY).?;
@@ -281,6 +338,14 @@ pub fn translateTargetsList(self: *Self, data: []const u8, buf: []u8) ![]const u
         try targets.appendBounded('\n');
     }
     return targets.items;
+}
+
+fn getTargetsList(self: *Self) ![]const u8 {
+    const len = self.clipboard.offers_len;
+    if (len >= ClipboardData.MAX_OFFERS) return error.NoMemory;
+
+    self.clipboard.mime[len] = self.clipboard.mime[self.atoms.getNoIntern("TARGETS").?];
+    return self.clipboard.mime[0..(len + 1)];
 }
 
 const AtomStash = struct {
@@ -427,7 +492,7 @@ const AtomStash = struct {
 };
 
 const ClipboardData = struct {
-    const MAX_OFFERS = 32;
+    const MAX_OFFERS = 64;
 
     mime: [MAX_OFFERS]c.xcb_atom_t = undefined,
     data: [MAX_OFFERS][]const u8   = undefined,
