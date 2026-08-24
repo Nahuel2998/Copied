@@ -27,6 +27,8 @@ max_transfer: usize,
 last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
 selection_is_mine: bool = false,
 
+// event_queue: [64]*c.xcb_generic_event_t,
+
 fn xcbConnect(pref_screen: ?*c_int) ?*c.xcb_connection_t {
     const conn = c.xcb_connect(null, pref_screen) orelse return null;
     errdefer c.xcb_disconnect(conn);
@@ -126,6 +128,9 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
+    self.claimOwnership();
+    _ = c.xcb_flush(self.conn);
+
     self.clipboard.reset();
     _ = try self.clipboard.saveCopy(mime, data);
 }
@@ -176,7 +181,16 @@ fn waitForEvent(self: *Self, target_evtype: u8) !*c.xcb_generic_event_t {
 
 fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
     const evtype = event.response_type & 0x7f;
-    switch (evtype) {
+
+    if (evtype >= self.xfixes_base) switch (evtype - self.xfixes_base) {
+        c.XCB_XFIXES_SELECTION_NOTIFY => {
+            self.handleXFixesSelectionNotify(@ptrCast(event)) catch |err| {
+                std.log.err("Unexpected error handling XFixesSelectionNotify: {}", .{err});
+            };
+        },
+        else => {},
+    }
+    else switch (evtype) {
         c.XCB_SELECTION_REQUEST => {
             self.handleSelectionRequest(@ptrCast(event));
         },
@@ -192,6 +206,28 @@ fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
         },
         else => {},
     }
+}
+
+fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_event_t) !void {
+    self.last_event_time = ev.timestamp;
+
+    if (ev.owner == c.XCB_NONE) {
+        self.claimOwnership();
+        _ = c.xcb_flush(self.conn);
+        return;
+    }
+
+    if (ev.owner == self.window) {
+        self.selection_is_mine = true;
+        return;
+    }
+
+    self.clipboard.reset();
+    self.selection_is_mine = false;
+}
+
+inline fn claimOwnership(self: *Self) void {
+    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.getNoIntern(SELECTION).?, self.last_event_time);
 }
 
 fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]const u8 {
@@ -286,6 +322,8 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
 
         const data = self.clipboard.get(ev.target) orelse break :blk false;
         if (data.len > self.max_transfer) {
+            // const data_owned = try std.allocator.dupe(u8, data);
+            // defer self.allocator.free(data);
             // self.sendIncr(ev.requestor, property, ev.target, data_owned) catch |err| {
             //     self.log.err("INCR transfer failed: {}", .{err});
             //     break :blk false;
@@ -301,6 +339,7 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
         notify.property = c.XCB_ATOM_NONE;
     }
     _ = c.xcb_send_event(self.conn, 0, ev.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
+    _ = c.xcb_flush(self.conn);
 }
 
 // fn sendIncr(self: *Self, requestor: c.xcb_window_t, property: c.xcb_atom_t, mime: c.xcb_atom_t, data: []const u8) !void {
