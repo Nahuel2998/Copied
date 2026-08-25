@@ -21,13 +21,13 @@ clipboard: ClipboardData,
 
 allocator: std.mem.Allocator,
 
-xfixes_base: u8,
-max_transfer: usize,
+xfixes_base:  u8,
+max_transfer: u32,
 
 last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
 selection_is_mine: bool = false,
 
-// event_queue: [64]*c.xcb_generic_event_t,
+incr_send: TransfersRing = .{},
 
 fn xcbConnect(pref_screen: ?*c_int) ?*c.xcb_connection_t {
     const conn = c.xcb_connect(null, pref_screen) orelse return null;
@@ -104,9 +104,9 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const window = try initWindow(conn, screen);
     const atoms  = try initAtoms(conn, allocator);
 
-    const xfixes_base         = try initXFixes(conn, window, atoms);
-    const max_request_len     = c.xcb_get_maximum_request_length(conn);
-    const max_transfer: usize = @min(MAX_TRANSFER_CAP, @as(usize, max_request_len) * 4 - 100);
+    const xfixes_base     = try initXFixes(conn, window, atoms);
+    const max_request_len = c.xcb_get_maximum_request_length(conn);
+    const max_transfer    = @min(MAX_TRANSFER_CAP, max_request_len * 4 - 100);
     _ = c.xcb_flush(conn);
 
     return .{
@@ -202,8 +202,7 @@ fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
             };
         },
         c.XCB_PROPERTY_NOTIFY => {
-            const ev: *c.xcb_property_notify_event_t = @ptrCast(event);
-            self.last_event_time = ev.time;
+            self.handlePropertyNotify(@ptrCast(event));
         },
         else => {},
     }
@@ -261,6 +260,28 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
     defer if (is_incr) self.allocator.free(data);
 
     return try self.clipboard.saveCopy(mime, data);
+}
+
+
+fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
+    self.last_event_time = ev.time;
+
+    if (ev.state != c.XCB_PROPERTY_DELETE or ev.window == self.window) return;
+    if (self.incr_send.find(ev.window, ev.atom)) |transfer| {
+        const sent = transfer.sendChunk(self.conn, self.max_transfer) catch |err| blk: {
+            std.log.err("Failed to send chunk: {}", .{err});
+            transfer.in_progress = false;
+            break :blk 0;
+        };
+        if (sent != 0) return;
+
+        self.allocator.free(transfer.data);
+        if (!self.incr_send.haveAnyOf(transfer.requestor)) {
+            const evmask: u32 = c.XCB_EVENT_MASK_NO_EVENT;
+            _ = c.xcb_change_window_attributes(self.conn, transfer.requestor, c.XCB_CW_EVENT_MASK, &evmask);
+            _ = c.xcb_flush(self.conn);
+        }
+    }
 }
 
 fn getProperty(self: *Self, property: c.xcb_atom_t) !*c.xcb_get_property_reply_t {
@@ -333,15 +354,11 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
         }
 
         if (data.len > self.max_transfer) {
-            // const data_owned = try std.allocator.dupe(u8, data);
-            // defer self.allocator.free(data);
-            // self.sendIncr(ev.requestor, property, ev.target, data_owned) catch |err| {
-            //     std.log.err("INCR transfer failed: {}", .{err});
-            //     break :blk false;
-            // };
-            // break :blk true;
-            std.log.err("INCR not yet supported, rejecting", .{});
-            break :blk false;
+            self.startIncrSend(ev.time, ev.requestor, property, ev.target, data) catch |err| {
+                std.log.err("Failed to start INCR send: {}", .{err});
+                break :blk false;
+            };
+            break :blk true;
         }
         _ = c.xcb_change_property(self.conn, c.XCB_PROP_MODE_REPLACE, ev.requestor, property, ev.target, 8, @intCast(data.len), data.ptr);
         break :blk true;
@@ -353,10 +370,37 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
     _ = c.xcb_flush(self.conn);
 }
 
-// fn sendIncr(self: *Self, requestor: c.xcb_window_t, property: c.xcb_atom_t, mime: c.xcb_atom_t, data: []const u8) !void {
-//     const data_len: u32 = @min(data.len, std.math.maxInt(u32));
-//     _ = c.xcb_change_property(self.conn, c.XCB_PROP_MODE_REPLACE, requestor, property, self.atoms.getNoIntern("INCR").?, 32, 2, &data_len);
-// }
+fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_window_t, property: c.xcb_atom_t, mime: c.xcb_atom_t, data: []const u8) !void {
+    const data_len: u32 = @min(data.len, std.math.maxInt(u32));
+    const cookie = c.xcb_change_property_checked(self.conn, c.XCB_PROP_MODE_REPLACE, requestor, property, self.atoms.getNoIntern("INCR").?, 32, 1, &data_len);
+    const err    = c.xcb_request_check(self.conn, cookie);
+    if (err != null) {
+        std.c.free(err);
+        return error.NoChange;
+    }
+
+    const evmask: u32   = c.XCB_EVENT_MASK_PROPERTY_CHANGE;
+    const listen_cookie = c.xcb_change_window_attributes_checked(self.conn, requestor, c.XCB_CW_EVENT_MASK, &evmask);
+    const listen_err    = c.xcb_request_check(self.conn, listen_cookie);
+    if (listen_err != null) {
+        std.c.free(listen_err);
+        return error.NoListen;
+    }
+
+    if (self.incr_send.occupied()) |stale_transfer| {
+        self.allocator.free(stale_transfer.data);
+        stale_transfer.notifyFailure(self.conn, self.atoms.getNoIntern(SELECTION).?);
+    }
+    self.incr_send.insert(
+        .{
+            .requestor = requestor,
+            .property  = property,
+            .mime      = mime,
+            .data      = try self.allocator.dupe(u8, data),
+            .timestamp = timestamp,
+        },
+    ) catch unreachable;
+}
 
 fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
     const selection = self.atoms.getNoIntern(SELECTION).?;
@@ -604,6 +648,90 @@ const ClipboardData = struct {
     pub fn deinit(self: *ClipboardData) void {
         self.arena.deinit();
         self.* = undefined;
+    }
+};
+
+const TransfersRing = struct {
+    const MAX_SENDS = 64;
+
+    next: usize = 0,
+    transfers: [MAX_SENDS]Transfer = std.mem.zeroes([MAX_SENDS]Transfer),
+
+    pub fn occupied(self: *@This()) ?*Transfer {
+        const transfer = &self.transfers[self.next];
+        if (transfer.in_progress) {
+            return transfer;
+        }
+        return null;
+    }
+
+    pub fn insert(self: *@This(), transfer: Transfer) !void {
+        if (self.occupied() != null) return error.SlotOccupied;
+
+        self.transfers[self.next] = transfer;
+
+        self.next = (self.next + 1) % MAX_SENDS;
+    }
+
+    pub fn find(self: *@This(), requestor: c.xcb_window_t, property: c.xcb_atom_t) ?*Transfer {
+        for (&self.transfers) |*transfer| {
+            if (!transfer.in_progress) continue;
+            if (transfer.requestor == requestor and transfer.property == property) {
+                return transfer;
+            }
+        }
+        return null;
+    }
+
+    pub fn haveAnyOf(self: @This(), requestor: c.xcb_window_t) bool {
+        for (self.transfers) |transfer| {
+            if (!transfer.in_progress) continue;
+            if (transfer.requestor == requestor) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+const Transfer = struct {
+    in_progress: bool = true,
+    requestor:   c.xcb_window_t,
+    property:    c.xcb_atom_t,
+    timestamp:   c.xcb_timestamp_t,
+    mime:        c.xcb_atom_t,
+    data:        []const u8,
+    offset:      usize = 0,
+
+    pub fn notifyFailure(self: *Transfer, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
+        var notify: c.xcb_selection_notify_event_t = .{
+            .response_type = c.XCB_SELECTION_NOTIFY,
+            .time          = self.timestamp,
+            .requestor     = self.requestor,
+            .selection     = selection,
+            .target        = self.mime,
+            .property      = c.XCB_ATOM_NONE,
+        };
+        _ = c.xcb_send_event(conn, 0, self.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
+        self.in_progress = false;
+    }
+
+    pub fn sendChunk(self: *Transfer, conn: *c.xcb_connection_t, max_chunk_len: u32) !usize {
+        const chunk_len: u32 = @min(max_chunk_len, self.data.len - self.offset);
+        const mode:      u8  = if (self.offset == 0) c.XCB_PROP_MODE_REPLACE else c.XCB_PROP_MODE_APPEND; // ICCCM says this although it changes nothing..?
+
+        const cookie = c.xcb_change_property_checked(conn, mode, self.requestor, self.property, self.mime, 8, chunk_len, self.data[self.offset..].ptr);
+        const err    = c.xcb_request_check(conn, cookie);
+        if (err != null) {
+            std.c.free(err);
+            return error.NoChange;
+        }
+
+        self.offset += chunk_len;
+        if (chunk_len == 0) {
+            self.in_progress = false;
+        }
+        return chunk_len;
     }
 };
 
