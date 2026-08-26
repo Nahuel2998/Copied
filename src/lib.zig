@@ -77,11 +77,14 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
     _ = try self.clipboard.saveCopy(mime, data);
 }
 
-pub fn paste(self: *Self, mime: ?c.xcb_atom_t) ?[]const u8 {
-    if (self.clipboard.get(mime)) |res| return res;
-    if (self.selection_is_mine)         return null;
+pub fn paste(self: *Self, maybe_mime: ?c.xcb_atom_t) ?[]const u8 {
     // FIXME: Temporary UTF8_STRING default
-    return self.retrieveSelection(mime orelse self.atoms.get("UTF8_STRING").?) catch |err| {
+    const mime = maybe_mime orelse self.atoms.get("UTF8_STRING").?;
+
+    if (self.convertSelection(mime)) |res| return res.data;
+    if (self.selection_is_mine)            return null;
+
+    return self.retrieveSelection(mime) catch |err| {
         std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
         return null;
     };
@@ -160,7 +163,7 @@ fn initWindow(conn: *c.xcb_connection_t, screen: *c.xcb_screen_t) !u32 {
 
 fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash {
     var atoms: AtomStash = .init(conn, allocator);
-    const common_atoms = [_][]const u8{RECV_PROPERTY, SELECTION, "TIMESTAMP", "TARGETS", "INCR", "UTF8_STRING", "STRING", "text/uri-list", "text/html", "image/png"};
+    const common_atoms = [_][]const u8{RECV_PROPERTY, SELECTION, "TIMESTAMP", "MULTIPLE", "TARGETS", "INCR", "UTF8_STRING", "STRING", "ATOM", "ATOM_PAIR", "text/uri-list", "text/html", "image/png"};
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -266,7 +269,7 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
         return null;
     }
 
-    const reply = try self.getProperty(ev.property);
+    const reply = try self.getProperty(self.window, ev.property, true);
     defer std.c.free(reply);
 
     const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
@@ -311,8 +314,8 @@ fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     }
 }
 
-fn getProperty(self: *Self, property: c.xcb_atom_t) !*c.xcb_get_property_reply_t {
-    const cookie = c.xcb_get_property(self.conn, 1, self.window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
+fn getProperty(self: *Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) !*c.xcb_get_property_reply_t {
+    const cookie = c.xcb_get_property(self.conn, @intFromBool(delete), window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
     const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
     if (reply.*.bytes_after > 0) {
         // FIXME: Probably keep reading rather than just failing?
@@ -336,7 +339,7 @@ fn receiveIncr(self: *Self, property: c.xcb_atom_t, init_capacity: usize) !struc
             continue;
         }
 
-        const reply = try self.getProperty(property);
+        const reply = try self.getProperty(self.window, property, true);
         defer std.c.free(reply);
 
         const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
@@ -370,32 +373,82 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
 
         if (ev.selection != self.atoms.get(SELECTION).?) break :blk false;
 
-        var data: []const u8 = undefined;
-        if (ev.target == self.atoms.get("TARGETS").?) {
-            data = self.getTargetsList() catch |err| {
-                std.log.err("Couldn't respond to TARGETS due to: {}", .{err});
-                break :blk false;
-            };
-        }
-        else {
-            data = self.clipboard.get(ev.target) orelse break :blk false;
-        }
-
-        if (data.len > self.max_transfer) {
-            self.startIncrSend(ev.time, ev.requestor, property, ev.target, data) catch |err| {
-                std.log.err("Failed to start INCR send: {}", .{err});
+        if (ev.target == self.atoms.get("MULTIPLE").?) {
+            self.startMultipleSend(ev.time, ev.requestor, property) catch |err| {
+                std.log.err("Couldn't start MULTIPLE send due to: {}", .{err});
                 break :blk false;
             };
             break :blk true;
         }
-        _ = c.xcb_change_property(self.conn, c.XCB_PROP_MODE_REPLACE, ev.requestor, property, ev.target, 8, @intCast(data.len), data.ptr);
-        break :blk true;
+
+        const data = self.convertSelection(ev.target) orelse break :blk false;
+        const ok   = self.sendData(ev.time, ev.requestor, property, data);
+        break :blk ok;
     };
     if (!handled) {
         notify.property = c.XCB_ATOM_NONE;
     }
     _ = c.xcb_send_event(self.conn, 0, ev.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
     _ = c.xcb_flush(self.conn);
+}
+
+fn convertSelection(self: *Self, target: c.xcb_atom_t) ?SendData {
+    var res: SendData = .{ .mime = target, .data = undefined };
+    if (target == self.atoms.get("TARGETS").?) {
+        res.format = 32;
+        res.mime   = self.atoms.get("ATOM").?;
+        res.data   = self.getTargetsList() catch |err| {
+            std.log.err("Couldn't respond to TARGETS due to: {}", .{err});
+            return null;
+        };
+    }
+    else {
+        res.data = self.clipboard.get(res.mime) orelse return null;
+    }
+    return res;
+}
+
+fn sendData(self: *Self, timestamp: c.xcb_atom_t, requestor: c.xcb_window_t, property: c.xcb_atom_t, sel: SendData) bool {
+    if (sel.data.len > self.max_transfer) {
+        self.startIncrSend(timestamp, requestor, property, sel.mime, sel.data) catch |err| {
+            std.log.err("Failed to start INCR send: {}", .{err});
+            return false;
+        };
+        return true;
+    }
+    const count = sel.data.len / (sel.format / 8);
+    _ = c.xcb_change_property(self.conn, c.XCB_PROP_MODE_REPLACE, requestor, property, sel.mime, sel.format, @intCast(count), sel.data.ptr);
+    return true;
+}
+
+fn startMultipleSend(self: *Self, timestamp: c.xcb_atom_t, requestor: c.xcb_window_t, property: c.xcb_atom_t) !void {
+    const reply = try self.getProperty(requestor, property, false);
+    defer std.c.free(reply);
+
+    const value:  [*]u8 = @ptrCast(c.xcb_get_property_value(reply));
+    const length: usize = @intCast(c.xcb_get_property_value_length(reply));
+    if (length % (2 * 4) != 0) return error.TheseAreNotPairs;
+
+    const AtomPair = extern struct {
+        mime: c.xcb_atom_t,
+        prop: c.xcb_atom_t,
+    };
+
+    var rejected_some: bool = false;
+    const atom_pairs: []AtomPair = @ptrCast(@alignCast(value[0..length]));
+    for (atom_pairs) |*pair| {
+        if (self.convertSelection(pair.mime)) |data| {
+            const ok = self.sendData(timestamp, requestor, pair.prop, data);
+            if (ok) continue;
+        }
+        pair.prop = c.XCB_ATOM_NONE;
+        rejected_some = true;
+    }
+
+    if (rejected_some) {
+        const ok = self.sendData(timestamp, requestor, property, .{ .format = 32, .mime = self.atoms.get("ATOM_PAIR").?, .data = @ptrCast(atom_pairs) });
+        if (!ok) return error.NoChange;
+    }
 }
 
 fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_window_t, property: c.xcb_atom_t, mime: c.xcb_atom_t, data: []const u8) !void {
@@ -444,11 +497,16 @@ fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
 }
 
 fn getTargetsList(self: *Self) ![]const u8 {
-    const len = self.clipboard.offers_len;
-    if (len >= ClipboardData.MAX_OFFERS) return error.NoMemory;
+    const APPEND_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE"};
 
-    self.clipboard.mime[len] = self.atoms.get("TARGETS").?;
-    return std.mem.sliceAsBytes(self.clipboard.mime[0..(len + 1)]);
+    const len = self.clipboard.offers_len + APPEND_TARGETS.len;
+    if (len > ClipboardData.MAX_OFFERS) return error.NoMemory;
+
+    for (APPEND_TARGETS, 0..) |atom_name, i| {
+        const atom = self.atoms.get(atom_name).?;
+        self.clipboard.mime[self.clipboard.offers_len + i] = atom;
+    }
+    return std.mem.sliceAsBytes(self.clipboard.mime[0..len]);
 }
 
 const AtomStash = struct {
@@ -609,13 +667,7 @@ const ClipboardData = struct {
         };
     }
 
-    pub fn get(self: ClipboardData, mime: ?c.xcb_atom_t) ?[]const u8 {
-        if (self.offers_len == 0) return null;
-
-        if (mime == null) {
-            return self.data[0];
-        }
-
+    pub fn get(self: ClipboardData, mime: c.xcb_atom_t) ?[]const u8 {
         for (0..self.offers_len) |i| {
             if (self.mime[i] == mime) {
                 return self.data[i];
@@ -744,6 +796,12 @@ const Transfer = struct {
         }
         return chunk_len;
     }
+};
+
+const SendData = struct {
+    mime: c.xcb_atom_t,
+    data: []const u8,
+    format: u8 = 8,
 };
 
 test {
