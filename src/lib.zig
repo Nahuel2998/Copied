@@ -55,8 +55,16 @@ pub fn init(allocator: std.mem.Allocator) !Self {
 }
 
 pub fn deinit(self: *Self) void {
-    self.atoms.deinit();
+    for (&self.incr_send.transfers) |*transfer| {
+        if (!transfer.in_progress) continue;
+        self.allocator.free(transfer.data);
+        transfer.notifyFailure(self.conn, self.atoms.getNoIntern(SELECTION).?);
+    }
+    _ = c.xcb_flush(self.conn);
+
     self.clipboard.deinit();
+    self.atoms.deinit();
+
     c.xcb_disconnect(self.conn);
     self.* = undefined;
 }
