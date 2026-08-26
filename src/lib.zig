@@ -29,6 +29,87 @@ selection_is_mine: bool = false,
 
 incr_send: TransfersRing = .{},
 
+pub fn init(allocator: std.mem.Allocator) !Self {
+    var pref_screen: c_int = undefined;
+    const conn = xcbConnect(&pref_screen) orelse return error.NoDisplay;
+
+    const screen = try getScreen(conn, pref_screen);
+    const window = try initWindow(conn, screen);
+    const atoms  = try initAtoms(conn, allocator);
+
+    const xfixes_base     = try initXFixes(conn, window, atoms);
+    const max_request_len = c.xcb_get_maximum_request_length(conn);
+    const max_transfer    = @min(MAX_TRANSFER_CAP, max_request_len * 4 - 100);
+    _ = c.xcb_flush(conn);
+
+    return .{
+        .conn   = conn,
+        .screen = screen,
+        .window = window,
+        .atoms  = atoms,
+        .clipboard = .init(allocator),
+        .allocator = allocator,
+        .xfixes_base = xfixes_base,
+        .max_transfer = max_transfer,
+    };
+}
+
+pub fn deinit(self: *Self) void {
+    self.atoms.deinit();
+    self.clipboard.deinit();
+    c.xcb_disconnect(self.conn);
+    self.* = undefined;
+}
+
+pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
+    self.claimOwnership();
+    _ = c.xcb_flush(self.conn);
+
+    self.clipboard.reset();
+    _ = try self.clipboard.saveCopy(mime, data);
+}
+
+pub fn paste(self: *Self, mime: ?c.xcb_atom_t) ?[]const u8 {
+    if (self.clipboard.get(mime)) |res| return res;
+    if (self.selection_is_mine)         return null;
+    // FIXME: Temporary UTF8_STRING default
+    return self.retrieveSelection(mime orelse self.atoms.getNoIntern("UTF8_STRING").?) catch |err| {
+        std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
+        return null;
+    };
+}
+
+pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
+    return c.xcb_get_file_descriptor(self.conn);
+}
+
+pub fn drainXEvents(self: *Self) void {
+    while (c.xcb_poll_for_event(self.conn)) |event| {
+        defer std.c.free(event);
+        self.handleXEvent(event);
+    }
+}
+
+pub fn translateTargetsList(self: *Self, data: []const u8, buf: []u8) ![]const u8 {
+    var i: usize = 0;
+    var targets_atoms: [ClipboardData.MAX_OFFERS]c.xcb_atom_t = undefined;
+    while (i + 4 <= data.len) : (i += 4) {
+        const atom = std.mem.readInt(c.xcb_atom_t, data[i..][0..4], .native);
+        targets_atoms[i / 4] = atom;
+    }
+
+    const targets_len = data.len / 4;
+    var targets_names: [ClipboardData.MAX_OFFERS][]const u8 = undefined;
+    try self.atoms.getNames(targets_atoms[0..targets_len], targets_names[0..targets_len]);
+
+    var targets: std.ArrayList(u8) = .initBuffer(buf);
+    for (targets_names[0..targets_len]) |name| {
+        try targets.appendSliceBounded(name);
+        try targets.appendBounded('\n');
+    }
+    return targets.items;
+}
+
 fn xcbConnect(pref_screen: ?*c_int) ?*c.xcb_connection_t {
     const conn = c.xcb_connect(null, pref_screen) orelse return null;
     errdefer c.xcb_disconnect(conn);
@@ -94,67 +175,6 @@ fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
     std.c.free(reply);
 
     return xfixes.*.first_event;
-}
-
-pub fn init(allocator: std.mem.Allocator) !Self {
-    var pref_screen: c_int = undefined;
-    const conn = xcbConnect(&pref_screen) orelse return error.NoDisplay;
-
-    const screen = try getScreen(conn, pref_screen);
-    const window = try initWindow(conn, screen);
-    const atoms  = try initAtoms(conn, allocator);
-
-    const xfixes_base     = try initXFixes(conn, window, atoms);
-    const max_request_len = c.xcb_get_maximum_request_length(conn);
-    const max_transfer    = @min(MAX_TRANSFER_CAP, max_request_len * 4 - 100);
-    _ = c.xcb_flush(conn);
-
-    return .{
-        .conn   = conn,
-        .screen = screen,
-        .window = window,
-        .atoms  = atoms,
-        .clipboard = .init(allocator),
-        .allocator = allocator,
-        .xfixes_base = xfixes_base,
-        .max_transfer = max_transfer,
-    };
-}
-
-pub fn deinit(self: *Self) void {
-    self.atoms.deinit();
-    self.clipboard.deinit();
-    c.xcb_disconnect(self.conn);
-    self.* = undefined;
-}
-
-pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
-    self.claimOwnership();
-    _ = c.xcb_flush(self.conn);
-
-    self.clipboard.reset();
-    _ = try self.clipboard.saveCopy(mime, data);
-}
-
-pub fn paste(self: *Self, mime: ?c.xcb_atom_t) ?[]const u8 {
-    if (self.clipboard.get(mime)) |res| return res;
-    if (self.selection_is_mine)         return null;
-    // FIXME: Temporary UTF8_STRING default
-    return self.retrieveSelection(mime orelse self.atoms.getNoIntern("UTF8_STRING").?) catch |err| {
-        std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
-        return null;
-    };
-}
-
-pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
-    return c.xcb_get_file_descriptor(self.conn);
-}
-
-pub fn drainXEvents(self: *Self) void {
-    while (c.xcb_poll_for_event(self.conn)) |event| {
-        defer std.c.free(event);
-        self.handleXEvent(event);
-    }
 }
 
 fn waitForEvent(self: *Self, target_evtype: u8) !*c.xcb_generic_event_t {
@@ -262,7 +282,6 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
     return try self.clipboard.saveCopy(mime, data);
 }
 
-
 fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     self.last_event_time = ev.time;
 
@@ -299,6 +318,7 @@ fn receiveIncr(self: *Self, property: c.xcb_atom_t, init_capacity: usize) !struc
     errdefer buf.deinit(self.allocator);
 
     while (true) {
+        // TODO: Receive asynchronously
         const event = try self.waitForEvent(c.XCB_PROPERTY_NOTIFY);
         defer std.c.free(event);
         self.handleXEvent(event);
@@ -408,30 +428,11 @@ fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
     _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, property, self.last_event_time);
     _ = c.xcb_flush(self.conn);
 
+    // TODO: Receive asynchronously
     const ev = try self.waitForEvent(c.XCB_SELECTION_NOTIFY);
     defer std.c.free(ev);
 
     return self.handleSelectionNotify(@ptrCast(ev));
-}
-
-pub fn translateTargetsList(self: *Self, data: []const u8, buf: []u8) ![]const u8 {
-    var i: usize = 0;
-    var targets_atoms: [ClipboardData.MAX_OFFERS]c.xcb_atom_t = undefined;
-    while (i + 4 <= data.len) : (i += 4) {
-        const atom = std.mem.readInt(c.xcb_atom_t, data[i..][0..4], .native);
-        targets_atoms[i / 4] = atom;
-    }
-
-    const targets_len = data.len / 4;
-    var targets_names: [ClipboardData.MAX_OFFERS][]const u8 = undefined;
-    try self.atoms.getNames(targets_atoms[0..targets_len], targets_names[0..targets_len]);
-
-    var targets: std.ArrayList(u8) = .initBuffer(buf);
-    for (targets_names[0..targets_len]) |name| {
-        try targets.appendSliceBounded(name);
-        try targets.appendBounded('\n');
-    }
-    return targets.items;
 }
 
 fn getTargetsList(self: *Self) ![]const u8 {
@@ -651,6 +652,8 @@ const ClipboardData = struct {
     }
 };
 
+// The idea here is inserting to the current position and increasing pos by one
+// By the time we've gone full circle, if that same spot is still in_progress, we cancel it
 const TransfersRing = struct {
     const MAX_SENDS = 64;
 
