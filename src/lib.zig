@@ -55,11 +55,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
 }
 
 pub fn deinit(self: *Self) void {
-    for (&self.incr_send.transfers) |*transfer| {
-        if (!transfer.in_progress) continue;
-        self.allocator.free(transfer.data);
-        transfer.notifyFailure(self.conn, self.atoms.get(SELECTION).?);
-    }
+    self.incr_send.cancelAll(self.allocator, self.conn, self.atoms.get(SELECTION).?);
     _ = c.xcb_flush(self.conn);
 
     self.clipboard.deinit();
@@ -73,7 +69,7 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
     self.claimOwnership();
     _ = c.xcb_flush(self.conn);
 
-    self.clipboard.reset();
+    self.reset();
     _ = try self.clipboard.saveCopy(mime, data);
 }
 
@@ -88,6 +84,11 @@ pub fn paste(self: *Self, maybe_mime: ?c.xcb_atom_t) ?[]const u8 {
         std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
         return null;
     };
+}
+
+pub fn reset(self: *Self) void {
+    self.incr_send.ownAll(self.allocator);
+    self.clipboard.reset();
 }
 
 pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
@@ -216,9 +217,7 @@ fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
 
     if (evtype >= self.xfixes_base) switch (evtype - self.xfixes_base) {
         c.XCB_XFIXES_SELECTION_NOTIFY => {
-            self.handleXFixesSelectionNotify(@ptrCast(event)) catch |err| {
-                std.log.err("Unexpected error handling XFixesSelectionNotify: {}", .{err});
-            };
+            self.handleXFixesSelectionNotify(@ptrCast(event));
         },
         else => {},
     }
@@ -239,7 +238,7 @@ fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
     }
 }
 
-fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_event_t) !void {
+fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_event_t) void {
     self.last_event_time = ev.timestamp;
 
     if (ev.owner == c.XCB_NONE) {
@@ -253,7 +252,7 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
         return;
     }
 
-    self.clipboard.reset();
+    self.reset();
     self.selection_is_mine = false;
 }
 
@@ -305,7 +304,7 @@ fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
         };
         if (sent != 0) return;
 
-        self.allocator.free(transfer.data);
+        transfer.disown(self.allocator);
         if (!self.incr_send.haveAnyOf(transfer.requestor)) {
             const evmask: u32 = c.XCB_EVENT_MASK_NO_EVENT;
             _ = c.xcb_change_window_attributes(self.conn, transfer.requestor, c.XCB_CW_EVENT_MASK, &evmask);
@@ -469,15 +468,14 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
     }
 
     if (self.incr_send.occupied()) |stale_transfer| {
-        self.allocator.free(stale_transfer.data);
-        stale_transfer.notifyFailure(self.conn, self.atoms.get(SELECTION).?);
+        stale_transfer.cancel(self.allocator, self.conn, self.atoms.get(SELECTION).?);
     }
     self.incr_send.insert(
         .{
             .requestor = requestor,
             .property  = property,
             .mime      = mime,
-            .data      = try self.allocator.dupe(u8, data),
+            .data      = data,
             .timestamp = timestamp,
         },
     ) catch unreachable;
@@ -755,6 +753,21 @@ const TransfersRing = struct {
         }
         return false;
     }
+
+    pub fn ownAll(self: *@This(), allocator: std.mem.Allocator) void {
+        for (&self.transfers) |*transfer| {
+            transfer.own(allocator) catch |err| {
+                std.log.err("Failed to own transfer, continuing anyways: {}", .{err});
+            };
+        }
+    }
+
+    pub fn cancelAll(self: *@This(), allocator: std.mem.Allocator, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
+        for (&self.transfers) |*transfer| {
+            transfer.cancel(allocator, conn, selection);
+        }
+        self.next = 0;
+    }
 };
 
 const Transfer = struct {
@@ -764,19 +777,28 @@ const Transfer = struct {
     timestamp:   c.xcb_timestamp_t,
     mime:        c.xcb_atom_t,
     data:        []const u8,
+    owned:       bool = false,
     offset:      usize = 0,
 
-    pub fn notifyFailure(self: *Transfer, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
-        var notify: c.xcb_selection_notify_event_t = .{
-            .response_type = c.XCB_SELECTION_NOTIFY,
-            .time          = self.timestamp,
-            .requestor     = self.requestor,
-            .selection     = selection,
-            .target        = self.mime,
-            .property      = c.XCB_ATOM_NONE,
-        };
-        _ = c.xcb_send_event(conn, 0, self.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
-        self.in_progress = false;
+    pub fn cancel(self: *Transfer, allocator: std.mem.Allocator, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
+        if (!self.in_progress) return;
+
+        self.disown(allocator);
+        self.notifyFailure(conn, selection);
+    }
+
+    pub fn own(self: *Transfer, allocator: std.mem.Allocator) !void {
+        if (!self.in_progress or self.owned) return;
+
+        self.data  = try allocator.dupe(u8, self.data);
+        self.owned = true;
+    }
+
+    pub fn disown(self: *Transfer, allocator: std.mem.Allocator) void {
+        if (self.owned) {
+            allocator.free(self.data);
+        }
+        self.owned = false;
     }
 
     pub fn sendChunk(self: *Transfer, conn: *c.xcb_connection_t, max_chunk_len: u32) !usize {
@@ -795,6 +817,19 @@ const Transfer = struct {
             self.in_progress = false;
         }
         return chunk_len;
+    }
+
+    fn notifyFailure(self: *Transfer, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
+        var notify: c.xcb_selection_notify_event_t = .{
+            .response_type = c.XCB_SELECTION_NOTIFY,
+            .time          = self.timestamp,
+            .requestor     = self.requestor,
+            .selection     = selection,
+            .target        = self.mime,
+            .property      = c.XCB_ATOM_NONE,
+        };
+        _ = c.xcb_send_event(conn, 0, self.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
+        self.in_progress = false;
     }
 };
 
