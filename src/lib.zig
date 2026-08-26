@@ -58,7 +58,7 @@ pub fn deinit(self: *Self) void {
     for (&self.incr_send.transfers) |*transfer| {
         if (!transfer.in_progress) continue;
         self.allocator.free(transfer.data);
-        transfer.notifyFailure(self.conn, self.atoms.getNoIntern(SELECTION).?);
+        transfer.notifyFailure(self.conn, self.atoms.get(SELECTION).?);
     }
     _ = c.xcb_flush(self.conn);
 
@@ -81,7 +81,7 @@ pub fn paste(self: *Self, mime: ?c.xcb_atom_t) ?[]const u8 {
     if (self.clipboard.get(mime)) |res| return res;
     if (self.selection_is_mine)         return null;
     // FIXME: Temporary UTF8_STRING default
-    return self.retrieveSelection(mime orelse self.atoms.getNoIntern("UTF8_STRING").?) catch |err| {
+    return self.retrieveSelection(mime orelse self.atoms.get("UTF8_STRING").?) catch |err| {
         std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
         return null;
     };
@@ -176,7 +176,7 @@ fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
     const evmask = c.XCB_XFIXES_SELECTION_EVENT_MASK_SET_SELECTION_OWNER
                  | c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_WINDOW_DESTROY
                  | c.XCB_XFIXES_SELECTION_EVENT_MASK_SELECTION_CLIENT_CLOSE;
-    const selection = atoms.getNoIntern(SELECTION).?;
+    const selection = atoms.get(SELECTION).?;
     _ = c.xcb_xfixes_select_selection_input(conn, window, selection, evmask);
 
     const reply = c.xcb_xfixes_query_version_reply(conn, cookie, null) orelse return error.NoXFixes;
@@ -255,7 +255,7 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
 }
 
 inline fn claimOwnership(self: *Self) void {
-    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.getNoIntern(SELECTION).?, self.last_event_time);
+    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.last_event_time);
 }
 
 fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]const u8 {
@@ -274,7 +274,7 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
 
     var mime = reply.*.type;
     var data = value[0..length];
-    const is_incr = reply.*.type == self.atoms.getNoIntern("INCR").?;
+    const is_incr = reply.*.type == self.atoms.get("INCR").?;
     if (is_incr) {
         var init_capacity: usize = 0;
         if (length == 4) {
@@ -368,10 +368,10 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
         // If we're no longer the owners, then we already cleared our data so we have nothing valid to send
         if (!self.selection_is_mine) break :blk false;
 
-        if (ev.selection != self.atoms.getNoIntern(SELECTION).?) break :blk false;
+        if (ev.selection != self.atoms.get(SELECTION).?) break :blk false;
 
         var data: []const u8 = undefined;
-        if (ev.target == self.atoms.getNoIntern("TARGETS").?) {
+        if (ev.target == self.atoms.get("TARGETS").?) {
             data = self.getTargetsList() catch |err| {
                 std.log.err("Couldn't respond to TARGETS due to: {}", .{err});
                 break :blk false;
@@ -400,7 +400,7 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
 
 fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_window_t, property: c.xcb_atom_t, mime: c.xcb_atom_t, data: []const u8) !void {
     const data_len: u32 = @min(data.len, std.math.maxInt(u32));
-    const cookie = c.xcb_change_property_checked(self.conn, c.XCB_PROP_MODE_REPLACE, requestor, property, self.atoms.getNoIntern("INCR").?, 32, 1, &data_len);
+    const cookie = c.xcb_change_property_checked(self.conn, c.XCB_PROP_MODE_REPLACE, requestor, property, self.atoms.get("INCR").?, 32, 1, &data_len);
     const err    = c.xcb_request_check(self.conn, cookie);
     if (err != null) {
         std.c.free(err);
@@ -417,7 +417,7 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
 
     if (self.incr_send.occupied()) |stale_transfer| {
         self.allocator.free(stale_transfer.data);
-        stale_transfer.notifyFailure(self.conn, self.atoms.getNoIntern(SELECTION).?);
+        stale_transfer.notifyFailure(self.conn, self.atoms.get(SELECTION).?);
     }
     self.incr_send.insert(
         .{
@@ -431,8 +431,8 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
 }
 
 fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
-    const selection = self.atoms.getNoIntern(SELECTION).?;
-    const property  = self.atoms.getNoIntern(RECV_PROPERTY).?;
+    const selection = self.atoms.get(SELECTION).?;
+    const property  = self.atoms.get(RECV_PROPERTY).?;
     _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, property, self.last_event_time);
     _ = c.xcb_flush(self.conn);
 
@@ -447,7 +447,7 @@ fn getTargetsList(self: *Self) ![]const u8 {
     const len = self.clipboard.offers_len;
     if (len >= ClipboardData.MAX_OFFERS) return error.NoMemory;
 
-    self.clipboard.mime[len] = self.atoms.getNoIntern("TARGETS").?;
+    self.clipboard.mime[len] = self.atoms.get("TARGETS").?;
     return std.mem.sliceAsBytes(self.clipboard.mime[0..(len + 1)]);
 }
 
@@ -474,12 +474,12 @@ const AtomStash = struct {
         self.* = undefined;
     }
 
-    pub fn getNoIntern(self: AtomStash, name: []const u8) ?c.xcb_atom_t {
+    pub fn get(self: AtomStash, name: []const u8) ?c.xcb_atom_t {
         return self.cache.get(name);
     }
 
-    pub fn get(self: *AtomStash, name: []const u8) !c.xcb_atom_t {
-        if (self.getNoIntern(name)) |atom| return atom;
+    pub fn getIntern(self: *AtomStash, name: []const u8) !c.xcb_atom_t {
+        if (self.get(name)) |atom| return atom;
 
         const res = try self.intern(1, .{ name });
         return res[0];
@@ -584,12 +584,12 @@ const AtomStash = struct {
         defer atoms.deinit();
 
         const name = "image/png";
-        const atom = try atoms.get(name);
+        const atom = try atoms.getIntern(name);
         try std.testing.expect(atoms.cache.get(name) != null);
         try std.testing.expect(atoms.ehcac.get(atom) != null);
 
         const primary_name = try atoms.getName(c.XCB_ATOM_PRIMARY);
-        const primary_atom = try atoms.get(primary_name);
+        const primary_atom = try atoms.getIntern(primary_name);
         try std.testing.expect(primary_atom == c.XCB_ATOM_PRIMARY);
     }
 };
