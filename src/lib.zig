@@ -11,6 +11,7 @@ const MAX_TRANSFER_CAP = 0xFFFFFF;
 
 const RECV_PROPERTY = "_COPIED_RECV";
 const SELECTION     = "CLIPBOARD";
+const META_TARGETS  = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"};
 
 conn:   *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
@@ -25,10 +26,13 @@ allocator: std.mem.Allocator,
 xfixes_base:  u8,
 max_transfer: u32,
 
-last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
+last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME, // FIXME: This is somewhat non-compliant
 selection_is_mine: bool = false,
 
 incr_send: TransfersRing = .{},
+
+// Used when returning a meta-target while not being the owners
+meta_buf: [ClipboardData.MIME_CAP * 4]u8 = undefined,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     var pref_screen: c_int = undefined;
@@ -168,9 +172,6 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
     const common_atoms = [_][]const u8{
         RECV_PROPERTY,
         SELECTION,
-        "TIMESTAMP",
-        "MULTIPLE",
-        "TARGETS",
         "INCR",
         "UTF8_STRING",
         "STRING",
@@ -180,7 +181,7 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
         "text/uri-list",
         "text/html",
         "image/png",
-    };
+    } ++ META_TARGETS;
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -306,7 +307,23 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]c
     }
     defer if (is_incr) self.allocator.free(data);
 
+    if (self.isMetaTarget(mime)) {
+        if (data.len > self.meta_buf.len) return error.NoMemory;
+        const res = self.meta_buf[0..data.len];
+        @memcpy(res, data);
+        return res;
+    }
+
     return try self.clipboard.saveCopy(mime, data);
+}
+
+fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
+    for (META_TARGETS) |target| {
+        if (mime == self.atoms.get(target).?) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
@@ -408,26 +425,23 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
     _ = c.xcb_flush(self.conn);
 }
 
-// FIXME: When querying meta-targets as not the owner, this returns bad data
-fn convertSelection(self: *Self, target: c.xcb_atom_t) ?SendData {
-    var res: SendData = .{ .mime = target, .data = undefined };
-    if (target == self.atoms.get("TARGETS").?) {
-        res.format = 32;
-        res.mime   = self.atoms.get("ATOM").?;
-        res.data   = self.getTargetsList() catch |err| {
-            std.log.err("Couldn't respond to TARGETS due to: {}", .{err});
-            return null;
+fn convertSelection(self: *Self, mime: c.xcb_atom_t) ?SendData {
+    if (self.selection_is_mine) {
+        if (mime == self.atoms.get("TARGETS").?) return .{
+            .format = 32,
+            .mime   = self.atoms.get("ATOM").?,
+            .data   = self.getTargetsList(),
+        };
+        if (mime == self.atoms.get("TIMESTAMP").?) return .{
+            .format = 32,
+            .mime   = self.atoms.get("INTEGER").?,
+            .data   = std.mem.asBytes(&self.timestamp),
         };
     }
-    else if (target == self.atoms.get("TIMESTAMP").?) {
-        res.format = 32;
-        res.mime   = self.atoms.get("INTEGER").?;
-        res.data   = std.mem.asBytes(&self.timestamp);
-    }
-    else {
-        res.data = self.clipboard.get(res.mime) orelse return null;
-    }
-    return res;
+    return .{
+        .mime = mime,
+        .data = self.clipboard.get(mime) orelse return null,
+    };
 }
 
 fn sendData(self: *Self, timestamp: c.xcb_atom_t, requestor: c.xcb_window_t, property: c.xcb_atom_t, sel: SendData) bool {
@@ -517,13 +531,9 @@ fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
     return self.handleSelectionNotify(@ptrCast(ev));
 }
 
-fn getTargetsList(self: *Self) ![]const u8 {
-    const APPEND_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"};
-
-    const len = self.clipboard.offers_len + APPEND_TARGETS.len;
-    if (len > ClipboardData.MAX_OFFERS) return error.NoMemory;
-
-    for (APPEND_TARGETS, 0..) |atom_name, i| {
+fn getTargetsList(self: *Self) []const u8 {
+    const len = self.clipboard.offers_len + META_TARGETS.len;
+    for (META_TARGETS, 0..) |atom_name, i| {
         const atom = self.atoms.get(atom_name).?;
         self.clipboard.mime[self.clipboard.offers_len + i] = atom;
     }
@@ -674,10 +684,11 @@ const AtomStash = struct {
 };
 
 const ClipboardData = struct {
-    const MAX_OFFERS = 64;
+    const MIME_CAP   = 64;
+    const MAX_OFFERS = MIME_CAP - META_TARGETS.len;
 
-    mime: [MAX_OFFERS]c.xcb_atom_t = undefined,
-    data: [MAX_OFFERS][]const u8   = undefined,
+    mime: [MIME_CAP]c.xcb_atom_t = undefined, // NOTE: We reuse this when building TARGETS
+    data: [MAX_OFFERS][]const u8 = undefined,
 
     offers_len: usize = 0,
     arena: std.heap.ArenaAllocator,
@@ -736,7 +747,7 @@ const ClipboardData = struct {
 // The idea here is inserting to the current position and increasing pos by one
 // By the time we've gone full circle, if that same spot is still in_progress, we cancel it
 const TransfersRing = struct {
-    const MAX_SENDS = 64;
+    const MAX_SENDS = ClipboardData.MIME_CAP;
 
     next: usize = 0,
     transfers: [MAX_SENDS]Transfer = std.mem.zeroes([MAX_SENDS]Transfer),
