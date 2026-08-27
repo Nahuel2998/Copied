@@ -30,6 +30,30 @@ last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME, // FIXME: This is somew
 selection_is_mine: bool = false,
 
 incr_send: TransfersRing = .{},
+recv: struct {
+    ing: bool = false,
+
+    mime: c.xcb_atom_t = c.XCB_ATOM_NONE,
+    data: ?[]const u8  = null,
+    incr: struct {
+        property: c.xcb_atom_t = c.XCB_ATOM_NONE,
+        buf: std.ArrayList(u8) = .empty,
+
+        pub fn init(property: c.xcb_atom_t, allocator: std.mem.Allocator, init_capacity: usize) @This() {
+            return .{
+                .property = property,
+                .buf      = std.ArrayList(u8).initCapacity(allocator, init_capacity) catch .empty,
+            };
+        }
+    } = .{},
+
+    pub fn fail(self: *@This(), allocator: std.mem.Allocator) void {
+        if (!self.ing) return;
+        self.ing  = false;
+        self.data = null;
+        self.incr.buf.deinit(allocator);
+    }
+} = .{},
 
 // Used when returning a meta-target while not being the owners
 meta_buf: [ClipboardData.MIME_CAP * 4]u8 = undefined,
@@ -78,21 +102,19 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
     _ = try self.clipboard.saveCopy(mime, data);
 }
 
-pub fn paste(self: *Self, maybe_mime: ?c.xcb_atom_t) ?[]const u8 {
+pub fn paste(self: *Self, sock: std.posix.fd_t, maybe_mime: ?c.xcb_atom_t) ?[]const u8 {
     // FIXME: Temporary UTF8_STRING default
     const mime = maybe_mime orelse self.atoms.get("UTF8_STRING").?;
 
     if (self.convertSelection(mime)) |res| return res.data;
     if (self.selection_is_mine)            return null;
 
-    return self.retrieveSelection(mime) catch |err| {
-        std.log.err("Failed to retrieve selection from selection owner: {}", .{err});
-        return null;
-    };
+    return self.retrieveSelection(sock, mime);
 }
 
 pub fn reset(self: *Self) void {
     self.incr_send.ownAll(self.allocator);
+    self.recv.fail(self.allocator);
     self.clipboard.reset();
 }
 
@@ -206,27 +228,14 @@ fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
     return xfixes.*.first_event;
 }
 
-fn waitForEvent(self: *Self, target_evtype: u8) !*c.xcb_generic_event_t {
-    // FIXME: Well I don't know what to do if you're just slow, ~5s seems plenty
-    const POLL_TIMEOUT = 500;
-    const POLL_TIMES   = 10;
-
+fn waitForEventUntilSock(self: *Self, sock: std.posix.fd_t) bool {
     var fds = [_]std.posix.pollfd{
         .{ .fd = self.getXFileDescriptor(), .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = sock,                      .events = std.posix.POLL.IN, .revents = 0 },
     };
-
-    for (0..POLL_TIMES) |_| {
-        while (c.xcb_poll_for_event(self.conn)) |event| {
-            const evtype = event.*.response_type & 0x7f;
-            if (evtype == target_evtype) {
-                return event;
-            }
-            defer std.c.free(event);
-            self.handleXEvent(event);
-        }
-        _ = try std.posix.poll(&fds, POLL_TIMEOUT);
-    }
-    return error.PollTimeout;
+    _ = std.posix.poll(&fds, -1) catch return false;
+    const sock_died = fds[1].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0;
+    return !sock_died;
 }
 
 fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
@@ -239,18 +248,9 @@ fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
         else => {},
     }
     else switch (evtype) {
-        c.XCB_SELECTION_REQUEST => {
-            self.handleSelectionRequest(@ptrCast(event));
-        },
-        c.XCB_SELECTION_NOTIFY => {
-            std.log.warn("Received dangling SelectionNotify, handling anyways", .{});
-            _ = self.handleSelectionNotify(@ptrCast(event)) catch |err| {
-                std.log.err("Unexpected error handling SelectionNotify: {}\n", .{err});
-            };
-        },
-        c.XCB_PROPERTY_NOTIFY => {
-            self.handlePropertyNotify(@ptrCast(event));
-        },
+        c.XCB_SELECTION_REQUEST => self.handleSelectionRequest(@ptrCast(event)),
+        c.XCB_SELECTION_NOTIFY  => self.handleSelectionNotify(@ptrCast(event)),
+        c.XCB_PROPERTY_NOTIFY   => self.handlePropertyNotify(@ptrCast(event)),
         else => {},
     }
 }
@@ -278,43 +278,59 @@ inline fn claimOwnership(self: *Self) void {
     _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.timestamp);
 }
 
-fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]const u8 {
+fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) void {
     self.last_event_time = ev.time;
 
     if (ev.property == c.XCB_ATOM_NONE) {
         std.log.debug("Selection owner rejected the request :(", .{});
-        return null;
+        self.recv.fail(self.allocator);
+        return;
     }
 
-    const reply = try self.getProperty(self.window, ev.property, true);
+    const reply = self.getProperty(self.window, ev.property, true) catch |err| {
+        std.log.err("Failed to read selection property: {}", .{err});
+        self.recv.fail(self.allocator);
+        return;
+    };
     defer std.c.free(reply);
 
     const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
     const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
 
-    var mime = reply.*.type;
-    var data = value[0..length];
-    const is_incr = reply.*.type == self.atoms.get("INCR").?;
-    if (is_incr) {
+    if (reply.*.type == self.atoms.get("INCR").?) {
         var init_capacity: usize = 0;
         if (length == 4) {
             init_capacity = std.mem.readInt(u32, value[0..4], .native);
         }
-
-        const res = try self.receiveIncr(ev.property, init_capacity);
-        mime = res.mime;
-        data = res.data;
+        self.recv.incr = .init(ev.property, self.allocator, init_capacity);
+        return;
     }
-    defer if (is_incr) self.allocator.free(data);
 
-    if (self.isMetaTarget(mime)) {
+    self.endReceive(value[0..length]) catch |err| {
+        std.log.err("Failed to save received selection: {}", .{err});
+        self.recv.fail(self.allocator);
+    };
+}
+
+fn endIncrReceive(self: *Self) !void {
+    try self.endReceive(self.recv.incr.buf.items);
+    self.recv.incr.buf.deinit(self.allocator);
+}
+
+fn endReceive(self: *Self, data: []const u8) !void {
+    var res: []const u8 = undefined;
+    if (self.isMetaTarget(self.recv.mime)) {
         if (data.len > self.meta_buf.len) return error.NoMemory;
-        const res = self.meta_buf[0..data.len];
-        @memcpy(res, data);
-        return res;
-    }
 
-    return try self.clipboard.saveCopy(mime, data);
+        const mut_res = self.meta_buf[0..data.len];
+        @memcpy(mut_res, data);
+        res = mut_res;
+    }
+    else {
+        res = try self.clipboard.saveCopy(self.recv.mime, data);
+    }
+    self.recv.data = res;
+    self.recv.ing  = false;
 }
 
 fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
@@ -329,7 +345,15 @@ fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
 fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     self.last_event_time = ev.time;
 
-    if (ev.state != c.XCB_PROPERTY_DELETE or ev.window == self.window) return;
+    if (ev.window == self.window) {
+        if (!self.recv.ing) return;
+        if (ev.atom  != self.recv.incr.property)  return;
+        if (ev.state != c.XCB_PROPERTY_NEW_VALUE) return;
+        self.receiveIncr();
+        return;
+    }
+
+    if (ev.state != c.XCB_PROPERTY_DELETE) return;
     if (self.incr_send.find(ev.window, ev.atom)) |transfer| {
         const sent = transfer.sendChunk(self.conn, self.max_transfer) catch |err| blk: {
             std.log.err("Failed to send chunk: {}", .{err});
@@ -347,6 +371,33 @@ fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     }
 }
 
+fn receiveIncr(self: *Self) void {
+    const property = self.recv.incr.property;
+
+    const reply = self.getProperty(self.window, property, true) catch |err| {
+        std.log.err("Failed to read INCR chunk: {}", .{err});
+        self.recv.fail(self.allocator);
+        return;
+    };
+    defer std.c.free(reply);
+
+    const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
+    const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
+
+    if (length != 0) {
+        self.recv.incr.buf.appendSlice(self.allocator, value[0..length]) catch |err| {
+            std.log.err("Failed to save INCR chunk: {}", .{err});
+            self.recv.fail(self.allocator);
+        };
+        return;
+    }
+
+    self.endIncrReceive() catch |err| {
+        std.log.err("Failed to finalize INCR receive: {}", .{err});
+        self.recv.fail(self.allocator);
+    };
+}
+
 fn getProperty(self: *Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) !*c.xcb_get_property_reply_t {
     const cookie = c.xcb_get_property(self.conn, @intFromBool(delete), window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
     const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
@@ -355,35 +406,6 @@ fn getProperty(self: *Self, window: c.xcb_window_t, property: c.xcb_atom_t, dele
         return error.NotTheEntireOwl;
     }
     return reply;
-}
-
-fn receiveIncr(self: *Self, property: c.xcb_atom_t, init_capacity: usize) !struct{ mime: c.xcb_atom_t, data: []const u8 } {
-    var buf: std.ArrayList(u8) = try .initCapacity(self.allocator, init_capacity);
-    errdefer buf.deinit(self.allocator);
-
-    while (true) {
-        // TODO: Receive asynchronously
-        const event = try self.waitForEvent(c.XCB_PROPERTY_NOTIFY);
-        defer std.c.free(event);
-        self.handleXEvent(event);
-
-        const ev: *c.xcb_property_notify_event_t = @ptrCast(event);
-        if (ev.atom != property or ev.state != c.XCB_PROPERTY_NEW_VALUE) {
-            continue;
-        }
-
-        const reply = try self.getProperty(self.window, property, true);
-        defer std.c.free(reply);
-
-        const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
-        const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
-
-        if (length == 0) return .{
-            .mime = reply.*.type,
-            .data = try buf.toOwnedSlice(self.allocator),
-        };
-        try buf.appendSlice(self.allocator, value[0..length]);
-    }
 }
 
 fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) void {
@@ -518,17 +540,25 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
     ) catch unreachable;
 }
 
-fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
+fn retrieveSelection(self: *Self, sock: std.posix.fd_t, mime: c.xcb_atom_t) ?[]const u8 {
+    if (self.recv.ing) unreachable;
+
     const selection = self.atoms.get(SELECTION).?;
     const property  = self.atoms.get(RECV_PROPERTY).?;
     _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, property, self.last_event_time);
     _ = c.xcb_flush(self.conn);
 
-    // TODO: Receive asynchronously
-    const ev = try self.waitForEvent(c.XCB_SELECTION_NOTIFY);
-    defer std.c.free(ev);
-
-    return self.handleSelectionNotify(@ptrCast(ev));
+    self.recv = .{
+        .ing  = true,
+        .mime = mime,
+    };
+    while (self.recv.ing) {
+        if (!self.waitForEventUntilSock(sock)) {
+            return null;
+        }
+        self.drainXEvents();
+    }
+    return self.recv.data;
 }
 
 fn getTargetsList(self: *Self) []const u8 {
