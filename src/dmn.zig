@@ -103,6 +103,11 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
                     return;
                 };
             }
+            else if (mime_atom == cb.atoms.get("TIMESTAMP").?) {
+                var timestamp_buf: [16]u8 = undefined;
+                const timestamp = std.mem.readInt(u32, data[0..4], .native);
+                data = std.fmt.bufPrint(&timestamp_buf, "{}\n", .{timestamp}) catch unreachable;
+            }
             cmn.writeAll(client, data) catch |err| {
                 std.log.err("Failed to send data to client: {}", .{err});
                 return;

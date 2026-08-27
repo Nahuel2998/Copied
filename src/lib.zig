@@ -18,6 +18,7 @@ window:  c.xcb_window_t,
 
 atoms:     AtomStash,
 clipboard: ClipboardData,
+timestamp: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
 
 allocator: std.mem.Allocator,
 
@@ -164,7 +165,22 @@ fn initWindow(conn: *c.xcb_connection_t, screen: *c.xcb_screen_t) !u32 {
 
 fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash {
     var atoms: AtomStash = .init(conn, allocator);
-    const common_atoms = [_][]const u8{RECV_PROPERTY, SELECTION, "TIMESTAMP", "MULTIPLE", "TARGETS", "INCR", "UTF8_STRING", "STRING", "ATOM", "ATOM_PAIR", "text/uri-list", "text/html", "image/png"};
+    const common_atoms = [_][]const u8{
+        RECV_PROPERTY,
+        SELECTION,
+        "TIMESTAMP",
+        "MULTIPLE",
+        "TARGETS",
+        "INCR",
+        "UTF8_STRING",
+        "STRING",
+        "INTEGER",
+        "ATOM",
+        "ATOM_PAIR",
+        "text/uri-list",
+        "text/html",
+        "image/png",
+    };
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -257,7 +273,8 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
 }
 
 inline fn claimOwnership(self: *Self) void {
-    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.last_event_time);
+    self.timestamp = self.last_event_time;
+    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.timestamp);
 }
 
 fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) !?[]const u8 {
@@ -391,6 +408,7 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
     _ = c.xcb_flush(self.conn);
 }
 
+// FIXME: When querying meta-targets as not the owner, this returns bad data
 fn convertSelection(self: *Self, target: c.xcb_atom_t) ?SendData {
     var res: SendData = .{ .mime = target, .data = undefined };
     if (target == self.atoms.get("TARGETS").?) {
@@ -400,6 +418,11 @@ fn convertSelection(self: *Self, target: c.xcb_atom_t) ?SendData {
             std.log.err("Couldn't respond to TARGETS due to: {}", .{err});
             return null;
         };
+    }
+    else if (target == self.atoms.get("TIMESTAMP").?) {
+        res.format = 32;
+        res.mime   = self.atoms.get("INTEGER").?;
+        res.data   = std.mem.asBytes(&self.timestamp);
     }
     else {
         res.data = self.clipboard.get(res.mime) orelse return null;
@@ -495,7 +518,7 @@ fn retrieveSelection(self: *Self, mime: c.xcb_atom_t) !?[]const u8 {
 }
 
 fn getTargetsList(self: *Self) ![]const u8 {
-    const APPEND_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE"};
+    const APPEND_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"};
 
     const len = self.clipboard.offers_len + APPEND_TARGETS.len;
     if (len > ClipboardData.MAX_OFFERS) return error.NoMemory;
