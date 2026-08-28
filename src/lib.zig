@@ -9,9 +9,15 @@ const Self = @This();
 // It was also last modified in 1994 so it can't be that incompatible with old clients/servers...
 const MAX_TRANSFER_CAP = 0xFFFFFF;
 
-const RECV_PROPERTY = "_COPIED_RECV";
-const SELECTION     = "CLIPBOARD";
-const META_TARGETS  = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"};
+const RECV_PROPERTIES = blk: {
+    var res: [8][]const u8 = undefined;
+    for (0..res.len) |i| {
+        res[i] = "_COPIED_RECV_" ++ .{('0' + i)};
+    }
+    break :blk res;
+};
+const SELECTION    = "CLIPBOARD";
+const META_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"};
 
 conn:   *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
@@ -29,31 +35,8 @@ max_transfer: u32,
 last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME, // FIXME: This is somewhat non-compliant
 selection_is_mine: bool = false,
 
-incr_send: TransfersRing = .{},
-recv: struct {
-    ing: bool = false,
-
-    mime: c.xcb_atom_t = c.XCB_ATOM_NONE,
-    data: ?[]const u8  = null,
-    incr: struct {
-        property: c.xcb_atom_t = c.XCB_ATOM_NONE,
-        buf: std.ArrayList(u8) = .empty,
-
-        pub fn init(property: c.xcb_atom_t, allocator: std.mem.Allocator, init_capacity: usize) @This() {
-            return .{
-                .property = property,
-                .buf      = std.ArrayList(u8).initCapacity(allocator, init_capacity) catch .empty,
-            };
-        }
-    } = .{},
-
-    pub fn fail(self: *@This(), allocator: std.mem.Allocator) void {
-        if (!self.ing) return;
-        self.ing  = false;
-        self.data = null;
-        self.incr.buf.deinit(allocator);
-    }
-} = .{},
+incr_send: SendRing = .{},
+recv_pool: RecvPool,
 
 // Used when returning a meta-target while not being the owners
 meta_buf: [ClipboardData.MIME_CAP * 4]u8 = undefined,
@@ -71,11 +54,13 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const max_transfer    = @min(MAX_TRANSFER_CAP, max_request_len * 4 - 100);
     _ = c.xcb_flush(conn);
 
+    std.log.debug("My window is: {}", .{window});
     return .{
         .conn   = conn,
         .screen = screen,
         .window = window,
         .atoms  = atoms,
+        .recv_pool = .init(atoms),
         .clipboard = .init(allocator),
         .allocator = allocator,
         .xfixes_base = xfixes_base,
@@ -114,7 +99,7 @@ pub fn paste(self: *Self, sock: std.posix.fd_t, maybe_mime: ?c.xcb_atom_t) ?[]co
 
 pub fn reset(self: *Self) void {
     self.incr_send.ownAll(self.allocator);
-    self.recv.fail(self.allocator);
+    self.recv_pool.failAll(self.allocator);
     self.clipboard.reset();
 }
 
@@ -192,7 +177,6 @@ fn initWindow(conn: *c.xcb_connection_t, screen: *c.xcb_screen_t) !u32 {
 fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash {
     var atoms: AtomStash = .init(conn, allocator);
     const common_atoms = [_][]const u8{
-        RECV_PROPERTY,
         SELECTION,
         "INCR",
         "UTF8_STRING",
@@ -203,7 +187,7 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
         "text/uri-list",
         "text/html",
         "image/png",
-    } ++ META_TARGETS;
+    } ++ META_TARGETS ++ RECV_PROPERTIES;
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -278,48 +262,56 @@ inline fn claimOwnership(self: *Self) void {
     _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.timestamp);
 }
 
+// FIXME: I think if there's a pending selection and the owner changes and we use the same mime,
+//        we may still pass it as appropriate and save stale data, possibly double-writing or ignoring the actual good data
+//        Checking the timestamp may fix this
 fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) void {
     self.last_event_time = ev.time;
 
     if (ev.property == c.XCB_ATOM_NONE) {
+        var transfer = self.recv_pool.findByMime(ev.target) orelse {
+            std.log.debug("Received notification for a transfer we don't care about anymore, ignoring", .{});
+            return;
+        };
         std.log.debug("Selection owner rejected the request :(", .{});
-        self.recv.fail(self.allocator);
+        transfer.fail(self.allocator);
         return;
     }
 
+    var transfer = self.recv_pool.findByProperty(ev.property) orelse {
+        std.log.debug("Received notification for a transfer we don't care about anymore, ignoring", .{});
+        return;
+    };
+
     const reply = self.getProperty(self.window, ev.property, true) catch |err| {
         std.log.err("Failed to read selection property: {}", .{err});
-        self.recv.fail(self.allocator);
+        transfer.fail(self.allocator);
         return;
     };
     defer std.c.free(reply);
 
     const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
     const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
+    // TODO: Check whether length == 0?
 
     if (reply.*.type == self.atoms.get("INCR").?) {
         var init_capacity: usize = 0;
         if (length == 4) {
             init_capacity = std.mem.readInt(u32, value[0..4], .native);
         }
-        self.recv.incr = .init(ev.property, self.allocator, init_capacity);
+        transfer.incr_buf = std.ArrayList(u8).initCapacity(self.allocator, init_capacity) catch .empty;
         return;
     }
 
-    self.endReceive(value[0..length]) catch |err| {
+    self.endReceive(transfer, value[0..length]) catch |err| {
         std.log.err("Failed to save received selection: {}", .{err});
-        self.recv.fail(self.allocator);
+        transfer.fail(self.allocator);
     };
 }
 
-fn endIncrReceive(self: *Self) !void {
-    try self.endReceive(self.recv.incr.buf.items);
-    self.recv.incr.buf.deinit(self.allocator);
-}
-
-fn endReceive(self: *Self, data: []const u8) !void {
+fn endReceive(self: *Self, transfer: *RecvTransfer, data: []const u8) !void {
     var res: []const u8 = undefined;
-    if (self.isMetaTarget(self.recv.mime)) {
+    if (self.isMetaTarget(transfer.mime)) {
         if (data.len > self.meta_buf.len) return error.NoMemory;
 
         const mut_res = self.meta_buf[0..data.len];
@@ -327,10 +319,10 @@ fn endReceive(self: *Self, data: []const u8) !void {
         res = mut_res;
     }
     else {
-        res = try self.clipboard.saveCopy(self.recv.mime, data);
+        res = try self.clipboard.saveCopy(transfer.mime, data);
     }
-    self.recv.data = res;
-    self.recv.ing  = false;
+    transfer.data   = res;
+    transfer.active = false;
 }
 
 fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
@@ -346,10 +338,12 @@ fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     self.last_event_time = ev.time;
 
     if (ev.window == self.window) {
-        if (!self.recv.ing) return;
-        if (ev.atom  != self.recv.incr.property)  return;
         if (ev.state != c.XCB_PROPERTY_NEW_VALUE) return;
-        self.receiveIncr();
+        if (self.recv_pool.findByProperty(ev.atom)) |transfer| {
+            if (transfer.incr_buf) |*incr_buf| {
+                self.receiveIncr(transfer, incr_buf);
+            }
+        }
         return;
     }
 
@@ -357,7 +351,7 @@ fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     if (self.incr_send.find(ev.window, ev.atom)) |transfer| {
         const sent = transfer.sendChunk(self.conn, self.max_transfer) catch |err| blk: {
             std.log.err("Failed to send chunk: {}", .{err});
-            transfer.in_progress = false;
+            transfer.active = false;
             break :blk 0;
         };
         if (sent != 0) return;
@@ -371,12 +365,10 @@ fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     }
 }
 
-fn receiveIncr(self: *Self) void {
-    const property = self.recv.incr.property;
-
-    const reply = self.getProperty(self.window, property, true) catch |err| {
+fn receiveIncr(self: *Self, transfer: *RecvTransfer, incr_buf: *std.ArrayList(u8)) void {
+    const reply = self.getProperty(self.window, transfer.property, true) catch |err| {
         std.log.err("Failed to read INCR chunk: {}", .{err});
-        self.recv.fail(self.allocator);
+        transfer.fail(self.allocator);
         return;
     };
     defer std.c.free(reply);
@@ -385,17 +377,19 @@ fn receiveIncr(self: *Self) void {
     const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
 
     if (length != 0) {
-        self.recv.incr.buf.appendSlice(self.allocator, value[0..length]) catch |err| {
+        incr_buf.appendSlice(self.allocator, value[0..length]) catch |err| {
             std.log.err("Failed to save INCR chunk: {}", .{err});
-            self.recv.fail(self.allocator);
+            transfer.fail(self.allocator);
         };
         return;
     }
 
-    self.endIncrReceive() catch |err| {
+    self.endReceive(transfer, incr_buf.items) catch |err| {
         std.log.err("Failed to finalize INCR receive: {}", .{err});
-        self.recv.fail(self.allocator);
+        transfer.fail(self.allocator);
+        return;
     };
+    transfer.endIncr(self.allocator);
 }
 
 fn getProperty(self: *Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) !*c.xcb_get_property_reply_t {
@@ -541,24 +535,24 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
 }
 
 fn retrieveSelection(self: *Self, sock: std.posix.fd_t, mime: c.xcb_atom_t) ?[]const u8 {
-    if (self.recv.ing) unreachable;
+    var transfer = self.recv_pool.acquire() catch |err| {
+        std.log.err("Couldn't acquire a slot for RecvTransfer: {}", .{err});
+        return null;
+    };
 
     const selection = self.atoms.get(SELECTION).?;
-    const property  = self.atoms.get(RECV_PROPERTY).?;
-    _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, property, self.last_event_time);
+    _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, transfer.property, self.last_event_time);
     _ = c.xcb_flush(self.conn);
 
-    self.recv = .{
-        .ing  = true,
-        .mime = mime,
-    };
-    while (self.recv.ing) {
+    transfer.mime   = mime;
+    transfer.active = true;
+    while (transfer.active) {
         if (!self.waitForEventUntilSock(sock)) {
             return null;
         }
         self.drainXEvents();
     }
-    return self.recv.data;
+    return transfer.data;
 }
 
 fn getTargetsList(self: *Self) []const u8 {
@@ -775,42 +769,69 @@ const ClipboardData = struct {
 };
 
 // The idea here is inserting to the current position and increasing pos by one
-// By the time we've gone full circle, if that same spot is still in_progress, we cancel it
-const TransfersRing = struct {
+// By the time we've gone full circle, if that same spot is still `active`, we may assume it's stale
+fn SlotRing(comptime T: type, comptime cap: usize) type {
+    comptime if (!@hasField(T, "active")) {
+        @compileError(@typeName(T) ++ " must have an `active: bool` field");
+    };
+
+    return struct {
+        next:  usize = 0,
+        slots: [cap]T = std.mem.zeroes([cap]T),
+
+        pub fn occupied(self: *@This()) ?*T {
+            const slot = &self.slots[self.next];
+            if (slot.active) return slot;
+            return null;
+        }
+
+        pub fn insert(self: *@This(), slot: T) !void {
+            if (self.occupied() != null) return error.SlotOccupied;
+            self.slots[self.next] = slot;
+            self.next = (self.next + 1) % cap;
+        }
+
+        pub fn find(self: *@This(), ctx: anytype, match: fn(@TypeOf(ctx), *T)bool) ?*T {
+            for (&self.slots) |*slot| {
+                if (!slot.active or !match(ctx, slot)) continue;
+                return slot;
+            }
+            return null;
+        }
+    };
+}
+
+const SendRing = struct {
     const MAX_SENDS = ClipboardData.MIME_CAP;
 
-    next: usize = 0,
-    transfers: [MAX_SENDS]Transfer = std.mem.zeroes([MAX_SENDS]Transfer),
+    ring: SlotRing(SendTransfer, MAX_SENDS) = .{},
 
-    pub fn occupied(self: *@This()) ?*Transfer {
-        const transfer = &self.transfers[self.next];
-        if (transfer.in_progress) {
-            return transfer;
-        }
-        return null;
+    pub fn occupied(self: *SendRing) ?*SendTransfer {
+        return self.ring.occupied();
     }
 
-    pub fn insert(self: *@This(), transfer: Transfer) !void {
-        if (self.occupied() != null) return error.SlotOccupied;
-
-        self.transfers[self.next] = transfer;
-
-        self.next = (self.next + 1) % MAX_SENDS;
+    pub fn insert(self: *SendRing, transfer: SendTransfer) !void {
+        return self.ring.insert(transfer);
     }
 
-    pub fn find(self: *@This(), requestor: c.xcb_window_t, property: c.xcb_atom_t) ?*Transfer {
-        for (&self.transfers) |*transfer| {
-            if (!transfer.in_progress) continue;
-            if (transfer.requestor == requestor and transfer.property == property) {
-                return transfer;
-            }
-        }
-        return null;
+    pub fn find(self: *SendRing, requestor: c.xcb_window_t, property: c.xcb_atom_t) ?*SendTransfer {
+        const Context = struct {
+            requestor: c.xcb_window_t,
+            property:  c.xcb_atom_t,
+        };
+        return self.ring.find(
+            Context{ .requestor = requestor, .property = property },
+            struct {
+                fn match(ctx: Context, transfer: *SendTransfer) bool {
+                    return (transfer.requestor == ctx.requestor and transfer.property == ctx.property);
+                }
+            }.match
+        );
     }
 
     pub fn haveAnyOf(self: @This(), requestor: c.xcb_window_t) bool {
-        for (self.transfers) |transfer| {
-            if (!transfer.in_progress) continue;
+        for (self.ring.slots) |transfer| {
+            if (!transfer.active) continue;
             if (transfer.requestor == requestor) {
                 return true;
             }
@@ -819,7 +840,7 @@ const TransfersRing = struct {
     }
 
     pub fn ownAll(self: *@This(), allocator: std.mem.Allocator) void {
-        for (&self.transfers) |*transfer| {
+        for (&self.ring.slots) |*transfer| {
             transfer.own(allocator) catch |err| {
                 std.log.err("Failed to own transfer, continuing anyways: {}", .{err});
             };
@@ -827,45 +848,46 @@ const TransfersRing = struct {
     }
 
     pub fn cancelAll(self: *@This(), allocator: std.mem.Allocator, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
-        for (&self.transfers) |*transfer| {
+        for (&self.ring.slots) |*transfer| {
             transfer.cancel(allocator, conn, selection);
         }
-        self.next = 0;
+        self.ring.next = 0;
     }
 };
 
-const Transfer = struct {
-    in_progress: bool = true,
-    requestor:   c.xcb_window_t,
-    property:    c.xcb_atom_t,
-    timestamp:   c.xcb_timestamp_t,
-    mime:        c.xcb_atom_t,
-    data:        []const u8,
-    owned:       bool = false,
-    offset:      usize = 0,
+const SendTransfer = struct {
+    active: bool = true,
 
-    pub fn cancel(self: *Transfer, allocator: std.mem.Allocator, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
-        if (!self.in_progress) return;
+    requestor: c.xcb_window_t,
+    property:  c.xcb_atom_t,
+    timestamp: c.xcb_timestamp_t,
+    mime:      c.xcb_atom_t,
+    data:      []const u8,
+    owned:     bool = false,
+    offset:    usize = 0,
+
+    pub fn cancel(self: *SendTransfer, allocator: std.mem.Allocator, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
+        if (!self.active) return;
 
         self.disown(allocator);
         self.notifyFailure(conn, selection);
     }
 
-    pub fn own(self: *Transfer, allocator: std.mem.Allocator) !void {
-        if (!self.in_progress or self.owned) return;
+    pub fn own(self: *SendTransfer, allocator: std.mem.Allocator) !void {
+        if (!self.active or self.owned) return;
 
         self.data  = try allocator.dupe(u8, self.data);
         self.owned = true;
     }
 
-    pub fn disown(self: *Transfer, allocator: std.mem.Allocator) void {
+    pub fn disown(self: *SendTransfer, allocator: std.mem.Allocator) void {
         if (self.owned) {
             allocator.free(self.data);
         }
         self.owned = false;
     }
 
-    pub fn sendChunk(self: *Transfer, conn: *c.xcb_connection_t, max_chunk_len: u32) !usize {
+    pub fn sendChunk(self: *SendTransfer, conn: *c.xcb_connection_t, max_chunk_len: u32) !usize {
         const chunk_len: u32 = @min(max_chunk_len, self.data.len - self.offset);
         const mode:      u8  = if (self.offset == 0) c.XCB_PROP_MODE_REPLACE else c.XCB_PROP_MODE_APPEND; // ICCCM says this although it changes nothing..?
 
@@ -878,12 +900,12 @@ const Transfer = struct {
 
         self.offset += chunk_len;
         if (chunk_len == 0) {
-            self.in_progress = false;
+            self.active = false;
         }
         return chunk_len;
     }
 
-    fn notifyFailure(self: *Transfer, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
+    fn notifyFailure(self: *SendTransfer, conn: *c.xcb_connection_t, selection: c.xcb_atom_t) void {
         var notify: c.xcb_selection_notify_event_t = .{
             .response_type = c.XCB_SELECTION_NOTIFY,
             .time          = self.timestamp,
@@ -893,7 +915,72 @@ const Transfer = struct {
             .property      = c.XCB_ATOM_NONE,
         };
         _ = c.xcb_send_event(conn, 0, self.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
-        self.in_progress = false;
+        self.active = false;
+    }
+};
+
+const RecvPool = struct {
+    transfers: [RECV_PROPERTIES.len]RecvTransfer,
+
+    pub fn init(atoms: AtomStash) RecvPool {
+        var self: RecvPool = undefined;
+        for (&self.transfers, RECV_PROPERTIES) |*transfer, prop_name| {
+            transfer.* = .{
+                .mime     = undefined,
+                .property = atoms.get(prop_name).?,
+            };
+        }
+        return self;
+    }
+
+    pub fn acquire(self: *RecvPool) !*RecvTransfer {
+        for (&self.transfers) |*transfer| {
+            if (!transfer.active) return transfer;
+        }
+        return error.NoMemory;
+    }
+
+    pub fn findByMime(self: *RecvPool, mime: c.xcb_atom_t) ?*RecvTransfer {
+        for (&self.transfers) |*transfer| {
+            if (transfer.mime == mime) return transfer;
+        }
+        return null;
+    }
+
+    pub fn findByProperty(self: *RecvPool, property: c.xcb_atom_t) ?*RecvTransfer {
+        for (&self.transfers) |*transfer| {
+            if (transfer.property == property) return transfer;
+        }
+        return null;
+    }
+
+    pub fn failAll(self: *RecvPool, allocator: std.mem.Allocator) void {
+        for (&self.transfers) |*transfer| {
+            transfer.fail(allocator);
+        }
+    }
+};
+
+const RecvTransfer = struct {
+    active: bool = false,
+
+    property: c.xcb_atom_t,
+    mime:     c.xcb_atom_t,
+    data:     ?[]const u8        = null,
+    incr_buf: ?std.ArrayList(u8) = null,
+
+    pub fn fail(self: *RecvTransfer, allocator: std.mem.Allocator) void {
+        if (!self.active) return;
+        self.active = false;
+        self.data   = null;
+        self.endIncr(allocator);
+    }
+
+    pub fn endIncr(self: *RecvTransfer, allocator: std.mem.Allocator) void {
+        if (self.incr_buf) |*incr_buf| {
+            incr_buf.deinit(allocator);
+            self.incr_buf = null;
+        }
     }
 };
 
