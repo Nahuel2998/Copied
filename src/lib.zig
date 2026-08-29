@@ -17,7 +17,8 @@ const RECV_PROPERTIES = blk: {
     break :blk res;
 };
 const SELECTION    = "CLIPBOARD";
-const META_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"};
+const META_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP", "SAVE_TARGETS"};
+const OTHER_META_TARGETS = .{"DELETE", "INSERT_PROPERTY", "INSERT_SELECTION"}; // We don't support these yet
 
 conn:   *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
@@ -39,7 +40,7 @@ incr_send: SendRing = .{},
 recv_pool: RecvPool,
 
 // Used when returning a meta-target while not being the owners
-meta_buf: [ClipboardData.MIME_CAP * 4]u8 = undefined,
+meta_buf: [ClipboardData.MIME_CAP * 4]u8 align(@alignOf(c.xcb_atom_t)) = undefined,
 
 pub fn init(allocator: std.mem.Allocator) !Self {
     var pref_screen: c_int = undefined;
@@ -52,6 +53,8 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const xfixes_base     = try initXFixes(conn, window, atoms);
     const max_request_len = c.xcb_get_maximum_request_length(conn);
     const max_transfer    = @min(MAX_TRANSFER_CAP, max_request_len * 4 - 100);
+
+    _ = c.xcb_set_selection_owner(conn, window, atoms.get("CLIPBOARD_MANAGER").?, c.XCB_CURRENT_TIME);
     _ = c.xcb_flush(conn);
 
     std.log.debug("My window is: {}", .{window});
@@ -94,7 +97,7 @@ pub fn paste(self: *Self, sock: std.posix.fd_t, maybe_mime: ?c.xcb_atom_t) ?[]co
     if (self.convertSelection(mime)) |res| return res.data;
     if (self.selection_is_mine)            return null;
 
-    return self.retrieveSelection(sock, mime);
+    return self.retrieveSelection(self.last_event_time, mime, sock);
 }
 
 pub fn reset(self: *Self) void {
@@ -178,6 +181,7 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
     var atoms: AtomStash = .init(conn, allocator);
     const common_atoms = [_][]const u8{
         SELECTION,
+        "CLIPBOARD_MANAGER",
         "INCR",
         "UTF8_STRING",
         "STRING",
@@ -187,7 +191,7 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
         "text/uri-list",
         "text/html",
         "image/png",
-    } ++ META_TARGETS ++ RECV_PROPERTIES;
+    } ++ META_TARGETS ++ OTHER_META_TARGETS ++ RECV_PROPERTIES;
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -212,12 +216,21 @@ fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
     return xfixes.*.first_event;
 }
 
-fn waitForEventUntilSock(self: *Self, sock: std.posix.fd_t) bool {
-    var fds = [_]std.posix.pollfd{
+fn waitForEvent(self: *Self, sock: ?std.posix.fd_t) bool {
+    var fds_buf: [2]std.posix.pollfd = .{
         .{ .fd = self.getXFileDescriptor(), .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = sock,                      .events = std.posix.POLL.IN, .revents = 0 },
+        undefined,
     };
-    _ = std.posix.poll(&fds, -1) catch return false;
+
+    var fds: []std.posix.pollfd = fds_buf[0..1];
+    if (sock) |fd| {
+        fds = fds_buf[0..2];
+        fds[1] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+    }
+
+    _ = std.posix.poll(fds, -1) catch return false;
+    if (sock == null) return true;
+
     const sock_died = fds[1].revents & (std.posix.POLL.HUP | std.posix.POLL.ERR) != 0;
     return !sock_died;
 }
@@ -242,6 +255,7 @@ fn handleXEvent(self: *Self, event: *c.xcb_generic_event_t) void {
 fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_event_t) void {
     self.last_event_time = ev.timestamp;
 
+    std.log.debug("Ownership changed to: {}", .{ev.owner});
     if (ev.owner == c.XCB_NONE) {
         self.claimOwnership();
         _ = c.xcb_flush(self.conn);
@@ -334,7 +348,7 @@ fn endReceive(self: *Self, transfer: *RecvTransfer, data: []const u8) !void {
 }
 
 fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
-    for (META_TARGETS) |target| {
+    for (META_TARGETS ++ OTHER_META_TARGETS) |target| {
         if (mime == self.atoms.get(target).?) {
             return true;
         }
@@ -426,11 +440,20 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
     };
 
     const handled = blk: {
+        if (ev.selection != self.atoms.get(SELECTION).?) {
+            if (ev.target == self.atoms.get("SAVE_TARGETS").?) {
+                self.saveTargets(ev.time, ev.requestor, property) catch |err| {
+                    std.log.err("Couldn't SAVE_TARGETS: {}", .{err});
+                    break :blk false;
+                };
+                break :blk true;
+            }
+            break :blk false;
+        }
+
         // Rather than comparing timestamp:
         // If we're no longer the owners, then we already cleared our data so we have nothing valid to send
         if (!self.selection_is_mine) break :blk false;
-
-        if (ev.selection != self.atoms.get(SELECTION).?) break :blk false;
 
         if (ev.target == self.atoms.get("MULTIPLE").?) {
             self.startMultipleSend(ev.time, ev.requestor, property) catch |err| {
@@ -449,6 +472,41 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
     }
     _ = c.xcb_send_event(self.conn, 0, ev.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
     _ = c.xcb_flush(self.conn);
+}
+
+fn saveTargets(self: *Self, timestamp: c.xcb_timestamp_t, window: c.xcb_window_t, property: c.xcb_atom_t) !void {
+    var targets_buf: [ClipboardData.MAX_OFFERS]c.xcb_atom_t = undefined;
+    var targets:                             []c.xcb_atom_t = undefined;
+    if (self.getProperty(window, property, false)) |reply| {
+        defer std.c.free(reply);
+
+        const value:  [*]u8 = @ptrCast(c.xcb_get_property_value(reply));
+        const length: usize = @intCast(c.xcb_get_property_value_length(reply));
+
+        const want_saved: []c.xcb_atom_t = @ptrCast(@alignCast(value[0..length]));
+        targets = targets_buf[0..@min(targets_buf.len, want_saved.len)];
+        @memcpy(targets, want_saved[0..targets.len]);
+    }
+    else |_| {
+        const all_targets_bytes = self.retrieveSelection(timestamp, self.atoms.get("TARGETS").?, null) orelse return error.NoTargets;
+        const all_targets: []const c.xcb_atom_t = @ptrCast(@alignCast(all_targets_bytes));
+
+        targets = targets_buf[0..@min(targets_buf.len, all_targets.len)];
+        @memcpy(targets, all_targets[0..targets.len]);
+    }
+
+    var i: usize = 0;
+    while (i < targets.len) {
+        if (self.isMetaTarget(targets[i]) or (self.clipboard.get(targets[i]) != null)) {
+            targets[i] = targets[targets.len - 1];
+            targets.len -= 1;
+            continue;
+        }
+        i += 1;
+    }
+
+    self.retrieveMultiple(timestamp, targets);
+    self.claimOwnership();
 }
 
 fn convertSelection(self: *Self, mime: c.xcb_atom_t) ?SendData {
@@ -539,20 +597,20 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
     ) catch unreachable;
 }
 
-fn retrieveSelection(self: *Self, sock: std.posix.fd_t, mime: c.xcb_atom_t) ?[]const u8 {
+fn retrieveSelection(self: *Self, timestamp: c.xcb_timestamp_t, mime: c.xcb_atom_t, sock: ?std.posix.fd_t) ?[]const u8 {
     var transfer = self.recv_pool.acquire() catch |err| {
         std.log.err("Couldn't acquire a slot for RecvTransfer: {}", .{err});
         return null;
     };
 
     const selection = self.atoms.get(SELECTION).?;
-    _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, transfer.property, self.last_event_time);
+    _ = c.xcb_convert_selection(self.conn, self.window, selection, mime, transfer.property, timestamp);
     _ = c.xcb_flush(self.conn);
 
     transfer.mime   = mime;
     transfer.active = true;
     while (transfer.active) {
-        if (!self.waitForEventUntilSock(sock)) {
+        if (!self.waitForEvent(sock)) {
             return null;
         }
         self.drainXEvents();
@@ -560,13 +618,26 @@ fn retrieveSelection(self: *Self, sock: std.posix.fd_t, mime: c.xcb_atom_t) ?[]c
     return transfer.data;
 }
 
-fn retrieveMultiple(self: *Self, mimes: []const c.xcb_atom_t) !void {
-    // TODO: Do (possibly multiple) retrieveMultipleBatch calls to get all of mimes
-    _ = self;
-    _ = mimes;
+fn retrieveMultiple(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.xcb_atom_t) void {
+    var i: usize = 0;
+    while (i < mimes.len) {
+        var batch_size = @min(self.recv_pool.slotsAvailable(), mimes.len - i);
+        defer i += batch_size;
+
+        if (batch_size > 2) {
+            if (self.retrieveMultipleBatch(timestamp, mimes[i..(i + batch_size)])) {
+                continue;
+            } else |err| if (err == error.NoMultiple) {
+                batch_size = mimes.len - i;
+            }
+        }
+        for (0..batch_size) |j| {
+            _ = self.retrieveSelection(timestamp, mimes[i + j], null);
+        }
+    }
 }
 
-fn retrieveMultipleBatch(self: *Self, mimes: []const c.xcb_atom_t) !void {
+fn retrieveMultipleBatch(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.xcb_atom_t) !void {
     std.debug.assert(0         <  mimes.len);
     std.debug.assert(mimes.len <= RecvPool.MAX_RECVS - 1);
 
@@ -589,10 +660,11 @@ fn retrieveMultipleBatch(self: *Self, mimes: []const c.xcb_atom_t) !void {
     multiple_transfer.active = true;
 
     const selection = self.atoms.get(SELECTION).?;
-    _ = c.xcb_convert_selection(self.conn, self.window, selection, multiple_transfer.mime, multiple_transfer.property, self.last_event_time);
+    _ = c.xcb_convert_selection(self.conn, self.window, selection, multiple_transfer.mime, multiple_transfer.property, timestamp);
     _ = c.xcb_flush(self.conn);
 
     while (multiple_transfer.active) {
+        _ = self.waitForEvent(null);
         self.drainXEvents();
     }
     const data = multiple_transfer.data orelse {
@@ -602,8 +674,8 @@ fn retrieveMultipleBatch(self: *Self, mimes: []const c.xcb_atom_t) !void {
         return error.NoMultiple;
     };
 
-    const cookies: [RecvPool.MAX_RECVS]c.xcb_get_property_cookie_t = undefined;
-    const res_pairs: []AtomPair = @ptrCast(@alignCast(data));
+    var   cookies: [RecvPool.MAX_RECVS]c.xcb_get_property_cookie_t = undefined;
+    const res_pairs: []const AtomPair = @ptrCast(@alignCast(data));
     for (transfers, res_pairs, 0..) |transfer, pair, i| {
         if (pair.prop == c.XCB_ATOM_NONE) {
             std.log.debug("[Multiple] Selection owner rejected the request :(", .{});
@@ -619,6 +691,7 @@ fn retrieveMultipleBatch(self: *Self, mimes: []const c.xcb_atom_t) !void {
 
     for (transfers) |transfer| {
         while (transfer.active) {
+            _ = self.waitForEvent(null);
             // FIXME: Possibly, some new event might acquire a slot we previously set as active=false
             //        It doesn't change anything here, but not intended
             self.drainXEvents();
@@ -1024,6 +1097,16 @@ const RecvPool = struct {
             if (i == out.len) return;
         }
         return error.NoMemory;
+    }
+
+    pub fn slotsAvailable(self: RecvPool) usize {
+        var res: usize = 0;
+        for (self.transfers) |transfer| {
+            if (!transfer.active) {
+                res += 1;
+            }
+        }
+        return res;
     }
 
     pub fn findByMime(self: *RecvPool, mime: c.xcb_atom_t) ?*RecvTransfer {
