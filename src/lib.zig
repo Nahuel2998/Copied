@@ -10,7 +10,7 @@ const Self = @This();
 const MAX_TRANSFER_CAP = 0xFFFFFF;
 
 const RECV_PROPERTIES = blk: {
-    var res: [8][]const u8 = undefined;
+    var res: [16][]const u8 = undefined;
     for (0..res.len) |i| {
         res[i] = "_COPIED_RECV_" ++ .{('0' + i)};
     }
@@ -58,7 +58,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     _ = c.xcb_flush(conn);
 
     std.log.debug("My window is: {}", .{window});
-    return .{
+    var self: Self = .{
         .conn   = conn,
         .screen = screen,
         .window = window,
@@ -69,6 +69,8 @@ pub fn init(allocator: std.mem.Allocator) !Self {
         .xfixes_base = xfixes_base,
         .max_transfer = max_transfer,
     };
+    self.getSomeTargets(self.last_event_time);
+    return self;
 }
 
 pub fn deinit(self: *Self) void {
@@ -189,7 +191,6 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
         "ATOM",
         "ATOM_PAIR",
         "text/uri-list",
-        "text/html",
         "image/png",
     } ++ META_TARGETS ++ OTHER_META_TARGETS ++ RECV_PROPERTIES;
     _ = try atoms.intern(common_atoms.len, common_atoms);
@@ -269,11 +270,22 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
 
     self.reset();
     self.selection_is_mine = false;
+    self.getSomeTargets(ev.timestamp);
 }
 
 inline fn claimOwnership(self: *Self) void {
     self.timestamp = self.last_event_time;
     _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.timestamp);
+}
+
+fn getSomeTargets(self: *Self, timestamp: c.xcb_timestamp_t) void {
+    const targets_bytes = self.retrieveSelection(timestamp, self.atoms.get("TARGETS").?, null) orelse return;
+    const targets: []const c.xcb_atom_t = @ptrCast(@alignCast(targets_bytes));
+    for (targets) |mime| {
+        if (mime == self.atoms.get("UTF8_STRING").? or mime == self.atoms.get("image/png") or mime == self.atoms.get("text/uri-list")) {
+            _ = self.retrieveSelection(timestamp, mime, null);
+        }
+    }
 }
 
 // FIXME: I think if there's a pending selection and the owner changes and we use the same mime,
@@ -505,6 +517,7 @@ fn saveTargets(self: *Self, timestamp: c.xcb_timestamp_t, window: c.xcb_window_t
         i += 1;
     }
 
+    std.log.debug("Saving {} targets from window {}", .{targets.len, window});
     self.retrieveMultiple(timestamp, targets);
     self.claimOwnership();
 }
@@ -622,10 +635,18 @@ fn retrieveMultiple(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.
     var i: usize = 0;
     while (i < mimes.len) {
         var batch_size = @min(self.recv_pool.slotsAvailable(), mimes.len - i);
-        defer i += batch_size;
+        if (batch_size == 0) {
+            // Wait for something to free-up
+            // Given _when_ we call this function, this should be unreachable
+            _ = self.waitForEvent(null);
+            self.drainXEvents();
+            continue;
+        }
 
         if (batch_size > 2) {
+            batch_size -= 1;
             if (self.retrieveMultipleBatch(timestamp, mimes[i..(i + batch_size)])) {
+                i += batch_size;
                 continue;
             } else |err| if (err == error.NoMultiple) {
                 batch_size = mimes.len - i;
@@ -634,12 +655,13 @@ fn retrieveMultiple(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.
         for (0..batch_size) |j| {
             _ = self.retrieveSelection(timestamp, mimes[i + j], null);
         }
+        i += batch_size;
     }
 }
 
 fn retrieveMultipleBatch(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.xcb_atom_t) !void {
     std.debug.assert(0         <  mimes.len);
-    std.debug.assert(mimes.len <= RecvPool.MAX_RECVS - 1);
+    std.debug.assert(mimes.len <= RecvPool.MAX_RECVS);
 
     var transfers_buf: [RecvPool.MAX_RECVS]*RecvTransfer = undefined;
     try self.recv_pool.acquireMultiple(transfers_buf[0..(mimes.len + 1)]);
@@ -656,7 +678,21 @@ fn retrieveMultipleBatch(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []con
     }
 
     const multiple_transfer = transfers_buf[mimes.len];
-    multiple_transfer.mime   = self.atoms.get("MULTIPLE").?;
+    multiple_transfer.mime  = self.atoms.get("MULTIPLE").?;
+    const err = c.xcb_request_check(
+        self.conn,
+        c.xcb_change_property_checked(
+            self.conn,
+            c.XCB_PROP_MODE_REPLACE,
+            self.window, multiple_transfer.property,
+            self.atoms.get("ATOM_PAIR").?,
+            32, @intCast(mimes.len * 2), &ask_pairs,
+        ),
+    );
+    if (err != null) {
+        std.c.free(err);
+        return error.NoChange;
+    }
     multiple_transfer.active = true;
 
     const selection = self.atoms.get(SELECTION).?;
