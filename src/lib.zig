@@ -278,17 +278,25 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) void 
         return;
     }
 
-    var transfer = self.recv_pool.findByProperty(ev.property) orelse {
+    const transfer = self.recv_pool.findByProperty(ev.property) orelse {
         std.log.debug("Received notification for a transfer we don't care about anymore, ignoring", .{});
         return;
     };
 
-    const reply = self.getProperty(self.window, ev.property, true) catch |err| {
-        std.log.err("Failed to read selection property: {}", .{err});
+    const cookie = self.getPropertyCookie(self.window, ev.property, true);
+    self.readSelectionResponse(transfer, cookie);
+}
+
+fn readSelectionResponse(self: *Self, transfer: *RecvTransfer, cookie: c.xcb_get_property_cookie_t) void {
+    const reply = c.xcb_get_property_reply(self.conn, cookie, null) orelse {
+        std.log.err("Failed to read selection property", .{});
         transfer.fail(self.allocator);
         return;
     };
     defer std.c.free(reply);
+
+    // What do you mean there's more than 4GB?
+    std.debug.assert(reply.*.bytes_after == 0);
 
     const value: [*]const u8 = @ptrCast(c.xcb_get_property_value(reply));
     const length:      usize = @intCast(c.xcb_get_property_value_length(reply));
@@ -392,14 +400,16 @@ fn receiveIncr(self: *Self, transfer: *RecvTransfer, incr_buf: *std.ArrayList(u8
     transfer.endIncr(self.allocator);
 }
 
-fn getProperty(self: *Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) !*c.xcb_get_property_reply_t {
-    const cookie = c.xcb_get_property(self.conn, @intFromBool(delete), window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
+fn getProperty(self: Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) !*c.xcb_get_property_reply_t {
+    const cookie = self.getPropertyCookie(window, property, delete);
     const reply  = c.xcb_get_property_reply(self.conn, cookie, null) orelse return error.NoProperty;
-    if (reply.*.bytes_after > 0) {
-        // FIXME: Probably keep reading rather than just failing?
-        return error.NotTheEntireOwl;
-    }
+    // I mean we asked for 4GB what do you mean there's more?
+    std.debug.assert(reply.*.bytes_after == 0);
     return reply;
+}
+
+inline fn getPropertyCookie(self: Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) c.xcb_get_property_cookie_t {
+    return c.xcb_get_property(self.conn, @intFromBool(delete), window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
 }
 
 fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) void {
@@ -481,11 +491,6 @@ fn startMultipleSend(self: *Self, timestamp: c.xcb_atom_t, requestor: c.xcb_wind
     const length: usize = @intCast(c.xcb_get_property_value_length(reply));
     if (length % (2 * 4) != 0) return error.TheseAreNotPairs;
 
-    const AtomPair = extern struct {
-        mime: c.xcb_atom_t,
-        prop: c.xcb_atom_t,
-    };
-
     var rejected_some: bool = false;
     const atom_pairs: []AtomPair = @ptrCast(@alignCast(value[0..length]));
     for (atom_pairs) |*pair| {
@@ -553,6 +558,72 @@ fn retrieveSelection(self: *Self, sock: std.posix.fd_t, mime: c.xcb_atom_t) ?[]c
         self.drainXEvents();
     }
     return transfer.data;
+}
+
+fn retrieveMultiple(self: *Self, mimes: []const c.xcb_atom_t) !void {
+    // TODO: Do (possibly multiple) retrieveMultipleBatch calls to get all of mimes
+    _ = self;
+    _ = mimes;
+}
+
+fn retrieveMultipleBatch(self: *Self, mimes: []const c.xcb_atom_t) !void {
+    std.debug.assert(0         <  mimes.len);
+    std.debug.assert(mimes.len <= RecvPool.MAX_RECVS - 1);
+
+    var transfers_buf: [RecvPool.MAX_RECVS]*RecvTransfer = undefined;
+    try self.recv_pool.acquireMultiple(transfers_buf[0..(mimes.len + 1)]);
+    const transfers = transfers_buf[0..mimes.len];
+
+    var ask_pairs: [RecvPool.MAX_RECVS]AtomPair = undefined;
+    for (transfers, mimes, 0..) |transfer, mime, i| {
+        transfer.mime   = mime;
+        transfer.active = true;
+        ask_pairs[i] = .{
+            .mime = mime,
+            .prop = transfer.property,
+        };
+    }
+
+    const multiple_transfer = transfers_buf[mimes.len];
+    multiple_transfer.mime   = self.atoms.get("MULTIPLE").?;
+    multiple_transfer.active = true;
+
+    const selection = self.atoms.get(SELECTION).?;
+    _ = c.xcb_convert_selection(self.conn, self.window, selection, multiple_transfer.mime, multiple_transfer.property, self.last_event_time);
+    _ = c.xcb_flush(self.conn);
+
+    while (multiple_transfer.active) {
+        self.drainXEvents();
+    }
+    const data = multiple_transfer.data orelse {
+        for (transfers) |transfer| {
+            transfer.fail(self.allocator);
+        }
+        return error.NoMultiple;
+    };
+
+    const cookies: [RecvPool.MAX_RECVS]c.xcb_get_property_cookie_t = undefined;
+    const res_pairs: []AtomPair = @ptrCast(@alignCast(data));
+    for (transfers, res_pairs, 0..) |transfer, pair, i| {
+        if (pair.prop == c.XCB_ATOM_NONE) {
+            std.log.debug("[Multiple] Selection owner rejected the request :(", .{});
+            transfer.fail(self.allocator);
+            continue;
+        }
+        cookies[i] = self.getPropertyCookie(self.window, pair.prop, true);
+    }
+    for (transfers, cookies[0..transfers.len]) |transfer, cookie| {
+        if (!transfer.active) continue;
+        self.readSelectionResponse(transfer, cookie);
+    }
+
+    for (transfers) |transfer| {
+        while (transfer.active) {
+            // FIXME: Possibly, some new event might acquire a slot we previously set as active=false
+            //        It doesn't change anything here, but not intended
+            self.drainXEvents();
+        }
+    }
 }
 
 fn getTargetsList(self: *Self) []const u8 {
@@ -920,7 +991,9 @@ const SendTransfer = struct {
 };
 
 const RecvPool = struct {
-    transfers: [RECV_PROPERTIES.len]RecvTransfer,
+    const MAX_RECVS = RECV_PROPERTIES.len;
+
+    transfers: [MAX_RECVS]RecvTransfer,
 
     pub fn init(atoms: AtomStash) RecvPool {
         var self: RecvPool = undefined;
@@ -936,6 +1009,19 @@ const RecvPool = struct {
     pub fn acquire(self: *RecvPool) !*RecvTransfer {
         for (&self.transfers) |*transfer| {
             if (!transfer.active) return transfer;
+        }
+        return error.NoMemory;
+    }
+
+    pub fn acquireMultiple(self: *RecvPool, out: []*RecvTransfer) !void {
+        std.debug.assert(out.len > 0);
+        var i: usize = 0;
+        for (&self.transfers) |*transfer| {
+            if (transfer.active) continue;
+
+            out[i] = transfer;
+            i += 1;
+            if (i == out.len) return;
         }
         return error.NoMemory;
     }
@@ -988,6 +1074,11 @@ const SendData = struct {
     mime: c.xcb_atom_t,
     data: []const u8,
     format: u8 = 8,
+};
+
+const AtomPair = extern struct {
+    mime: c.xcb_atom_t,
+    prop: c.xcb_atom_t,
 };
 
 test {
