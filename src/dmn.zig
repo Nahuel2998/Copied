@@ -83,7 +83,7 @@ fn run(init: std.process.Init) !void {
             break;
         }
         if (fds[1].revents & std.posix.POLL.IN != 0) {
-            cb.drainXEvents();
+            _ = cb.drainXEvents();
         }
         if (fds[2].revents & std.posix.POLL.IN != 0) {
             handleCliConnect(allocator, cli_fd, &cb);

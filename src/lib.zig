@@ -113,11 +113,21 @@ pub fn getXFileDescriptor(self: Self) std.posix.fd_t {
     return c.xcb_get_file_descriptor(self.conn);
 }
 
-pub fn drainXEvents(self: *Self) void {
+pub fn drainXEvents(self: *Self) bool {
+    var drained = false;
     while (c.xcb_poll_for_event(self.conn)) |event| {
         defer std.c.free(event);
         self.handleXEvent(event);
+        drained = true;
     }
+    return drained;
+}
+
+pub fn waitDrainXEvents(self: *Self, sock: ?std.posix.fd_t) bool {
+    if (self.drainXEvents()) return true;
+
+    if (!self.waitForEvent(sock)) return false;
+    return self.drainXEvents();
 }
 
 pub fn translateTargetsList(self: *Self, data: []const u8, buf: []u8) ![]const u8 {
@@ -219,6 +229,12 @@ fn initXFixes(conn: *c.xcb_connection_t, window: u32, atoms: AtomStash) !u8 {
 }
 
 fn waitForEvent(self: *Self, sock: ?std.posix.fd_t) bool {
+    // std.log.debug("Waiting for events...", .{});
+    // for (self.recv_pool.transfers) |transfer| {
+    //     if (!transfer.active) continue;
+    //     std.log.debug("Transfer pending of mime={s}", .{self.atoms.getName(transfer.mime) catch "idk"});
+    // }
+
     var fds_buf: [2]std.posix.pollfd = .{
         .{ .fd = self.getXFileDescriptor(), .events = std.posix.POLL.IN, .revents = 0 },
         undefined,
@@ -259,6 +275,7 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
 
     std.log.debug("Ownership changed to: {}", .{ev.owner});
     if (ev.owner == c.XCB_NONE) {
+        self.recv_pool.failAll(self.allocator);
         self.claimOwnership();
         _ = c.xcb_flush(self.conn);
         return;
@@ -322,6 +339,8 @@ fn readSelectionResponse(self: *Self, transfer: *RecvTransfer, cookie: c.xcb_get
     };
     defer std.c.free(reply);
 
+    // std.log.debug("Read property {s}", .{self.atoms.getName(transfer.property) catch "idk"});
+
     // What do you mean there's more than 4GB?
     std.debug.assert(reply.*.bytes_after == 0);
 
@@ -372,10 +391,13 @@ fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
 fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
     self.last_event_time = ev.time;
 
+    // std.log.debug("Received PropertyNotify for window {} for property {s} with state {}", .{ev.window, self.atoms.getName(ev.atom) catch "idk", ev.state});
     if (ev.window == self.window) {
         if (ev.state != c.XCB_PROPERTY_NEW_VALUE) return;
         if (self.recv_pool.findByProperty(ev.atom)) |transfer| {
+            // std.log.debug("It belongs to a recv", .{});
             if (transfer.incr_buf) |*incr_buf| {
+                // std.log.debug("an INCR to be specific", .{});
                 self.receiveIncr(transfer, incr_buf);
             }
         }
@@ -436,6 +458,7 @@ fn getProperty(self: Self, window: c.xcb_window_t, property: c.xcb_atom_t, delet
 }
 
 inline fn getPropertyCookie(self: Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) c.xcb_get_property_cookie_t {
+    // std.log.debug("Reading property {s} of window {}; delete={}", .{self.atoms.ehcac.get(property) orelse "idk", window, delete});
     return c.xcb_get_property(self.conn, @intFromBool(delete), window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
 }
 
@@ -452,6 +475,7 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
         .property      = property,
     };
 
+    // std.log.debug("Window {} wants to convert {s} to {}", .{ev.requestor, self.atoms.getName(ev.selection) catch "idk", ev.target});
     const handled = blk: {
         if (ev.selection != self.atoms.get(SELECTION).?) {
             if (ev.target == self.atoms.get("SAVE_TARGETS").?) {
@@ -612,6 +636,11 @@ fn startIncrSend(self: *Self, timestamp: c.xcb_timestamp_t, requestor: c.xcb_win
 }
 
 fn retrieveSelection(self: *Self, timestamp: c.xcb_timestamp_t, mime: c.xcb_atom_t, sock: ?std.posix.fd_t) ?[]const u8 {
+    if (self.selection_is_mine) {
+        std.log.debug("Refusing to retrieveSelection myself", .{});
+        return null;
+    }
+
     var transfer = self.recv_pool.acquire() catch |err| {
         std.log.err("Couldn't acquire a slot for RecvTransfer: {}", .{err});
         return null;
@@ -624,10 +653,9 @@ fn retrieveSelection(self: *Self, timestamp: c.xcb_timestamp_t, mime: c.xcb_atom
     transfer.mime   = mime;
     transfer.active = true;
     while (transfer.active) {
-        if (!self.waitForEvent(sock)) {
+        if (!self.waitDrainXEvents(sock)) {
             return null;
         }
-        self.drainXEvents();
     }
     return transfer.data;
 }
@@ -639,8 +667,7 @@ fn retrieveMultiple(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.
         if (batch_size == 0) {
             // Wait for something to free-up
             // Given _when_ we call this function, this should be unreachable
-            _ = self.waitForEvent(null);
-            self.drainXEvents();
+            _ = self.waitDrainXEvents(null);
             continue;
         }
 
@@ -663,6 +690,11 @@ fn retrieveMultiple(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.
 fn retrieveMultipleBatch(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []const c.xcb_atom_t) !void {
     std.debug.assert(0         <  mimes.len);
     std.debug.assert(mimes.len <= RecvPool.MAX_RECVS);
+
+    if (self.selection_is_mine) {
+        std.log.debug("Refusing to retrieveMultipleBatch myself", .{});
+        return;
+    }
 
     var transfers_buf: [RecvPool.MAX_RECVS]*RecvTransfer = undefined;
     try self.recv_pool.acquireMultiple(transfers_buf[0..(mimes.len + 1)]);
@@ -701,8 +733,7 @@ fn retrieveMultipleBatch(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []con
     _ = c.xcb_flush(self.conn);
 
     while (multiple_transfer.active) {
-        _ = self.waitForEvent(null);
-        self.drainXEvents();
+        _ = self.waitDrainXEvents(null);
     }
     const data = multiple_transfer.data orelse {
         for (transfers) |transfer| {
@@ -728,10 +759,9 @@ fn retrieveMultipleBatch(self: *Self, timestamp: c.xcb_timestamp_t, mimes: []con
 
     for (transfers) |transfer| {
         while (transfer.active) {
-            _ = self.waitForEvent(null);
             // FIXME: Possibly, some new event might acquire a slot we previously set as active=false
             //        It doesn't change anything here, but not intended
-            self.drainXEvents();
+            _ = self.waitDrainXEvents(null);
         }
     }
 }
