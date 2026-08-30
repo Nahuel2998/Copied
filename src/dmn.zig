@@ -4,6 +4,11 @@ const linux = std.os.linux;
 const cmn = @import("cmn.zig");
 const Clipboard = @import("lib");
 
+var sig_pipe: [2]std.posix.fd_t = undefined;
+fn handleSigterm(_: linux.SIG) callconv(.c) void {
+    _ = linux.write(sig_pipe[1], "please die", 1);
+}
+
 pub fn main(init: std.process.Init) !void {
     run(init) catch |err| switch (err) {
         error.Expected => std.process.exit(1),
@@ -12,7 +17,9 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn run(init: std.process.Init) !void {
-    var cb = Clipboard.init(init.gpa) catch |err| {
+    const allocator = init.gpa;
+
+    var cb = Clipboard.init(allocator) catch |err| {
         switch (err) {
             error.NoDisplay => std.log.err("Failed to open display", .{}),
             error.NoScreen  => std.log.err("Failed to get screen", .{}),
@@ -44,19 +51,42 @@ fn run(init: std.process.Init) !void {
     }
     const x_fd = cb.getXFileDescriptor();
 
-    // Look I'd want to use the shiny new Io interface, but I can't .poll() otherwise
+    _ = cmn.call( linux.pipe(&sig_pipe) ) orelse {
+        std.log.err("Failed to create signal pipe", .{});
+        return error.Expected;
+    };
+    defer {
+        _ = linux.close(sig_pipe[0]);
+        _ = linux.close(sig_pipe[1]);
+    }
+
+    const sigact = linux.Sigaction{
+        .handler = .{ .handler = handleSigterm },
+        .mask    = linux.sigemptyset(),
+        .flags   = 0,
+    };
+    _ = cmn.call( linux.sigaction(.INT, &sigact, null) ) orelse {
+        std.log.err("Failed to setup signal handler", .{});
+        return error.Expected;
+    };
+
+    // FIXME: I'd want to use the shiny new Io interface, but I can't .poll() otherwise
     var fds = [_]std.posix.pollfd{
-        .{ .fd =   x_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd = cli_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = sig_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd =        x_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd =      cli_fd, .events = std.posix.POLL.IN, .revents = 0 },
     };
     while (true) {
         _ = try std.posix.poll(&fds, -1);
 
         if (fds[0].revents & std.posix.POLL.IN != 0) {
-            cb.drainXEvents();
+            break;
         }
         if (fds[1].revents & std.posix.POLL.IN != 0) {
-            handleCliConnect(init.gpa, cli_fd, &cb);
+            cb.drainXEvents();
+        }
+        if (fds[2].revents & std.posix.POLL.IN != 0) {
+            handleCliConnect(allocator, cli_fd, &cb);
         }
     }
 }

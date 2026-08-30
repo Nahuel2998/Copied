@@ -75,6 +75,7 @@ pub fn init(allocator: std.mem.Allocator) !Self {
 
 pub fn deinit(self: *Self) void {
     self.incr_send.cancelAll(self.allocator, self.conn, self.atoms.get(SELECTION).?);
+    self.recv_pool.failAll(self.allocator);
     _ = c.xcb_flush(self.conn);
 
     self.clipboard.deinit();
