@@ -16,9 +16,12 @@ const RECV_PROPERTIES = blk: {
     }
     break :blk res;
 };
-const SELECTION    = "CLIPBOARD";
-const META_TARGETS = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP", "SAVE_TARGETS"};
-const OTHER_META_TARGETS = .{"DELETE", "INSERT_PROPERTY", "INSERT_SELECTION"}; // We don't support these yet
+const SELECTION = "CLIPBOARD";
+
+const META_TARGETS       = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP", "SAVE_TARGETS"};
+const OTHER_META_TARGETS = [_][]const u8{"DELETE", "INSERT_PROPERTY", "INSERT_SELECTION"}; // We don't support these yet
+
+const EAGER_COPY_TARGETS = [_][]const u8{"UTF8_STRING", "image/png", "text/uri-list"};
 
 conn:   *c.xcb_connection_t,
 screen: *c.xcb_screen_t,
@@ -201,9 +204,7 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
         "INTEGER",
         "ATOM",
         "ATOM_PAIR",
-        "text/uri-list",
-        "image/png",
-    } ++ META_TARGETS ++ OTHER_META_TARGETS ++ RECV_PROPERTIES;
+    } ++ META_TARGETS ++ OTHER_META_TARGETS ++ EAGER_COPY_TARGETS ++ RECV_PROPERTIES;
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -299,11 +300,11 @@ inline fn claimOwnership(self: *Self) void {
 fn getSomeTargets(self: *Self, timestamp: c.xcb_timestamp_t) void {
     const targets_bytes = self.retrieveSelection(timestamp, self.atoms.get("TARGETS").?, null) orelse return;
     const targets: []const c.xcb_atom_t = @ptrCast(@alignCast(targets_bytes));
-    for (targets) |mime| {
-        if (mime == self.atoms.get("UTF8_STRING").? or mime == self.atoms.get("image/png") or mime == self.atoms.get("text/uri-list")) {
+    for (targets) |mime| for (EAGER_COPY_TARGETS) |eager_copy| {
+        if (mime == self.atoms.get(eager_copy).?) {
             _ = self.retrieveSelection(timestamp, mime, null);
         }
-    }
+    };
 }
 
 // FIXME: I think if there's a pending selection and the owner changes and we use the same mime,
