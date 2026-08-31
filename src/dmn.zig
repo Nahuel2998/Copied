@@ -1,10 +1,15 @@
 const std   = @import("std");
 const linux = std.os.linux;
 
+const opt = @import("opt");
 const cmn = @import("cmn.zig");
 const Clipboard = @import("lib");
 
 const ipc_log = std.log.scoped(.ipc);
+const IpcSock = struct {
+    fd:   std.posix.fd_t,
+    path: cmn.SockPath,
+};
 
 var sig_pipe: [2]std.posix.fd_t = undefined;
 fn handleSigterm(_: linux.SIG) callconv(.c) void {
@@ -33,24 +38,28 @@ fn run(init: std.process.Init) !void {
     };
     defer cb.deinit();
 
-    const run_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse {
-        std.log.err("XDG_RUNTIME_DIR isn't set", .{});
-        return error.Expected;
-    };
-    const path = cmn.getSockPath(run_dir);
+    const ipc_sock: ?IpcSock = if (opt.ipc_sock) blk: {
+        const run_dir = init.environ_map.get("XDG_RUNTIME_DIR") orelse {
+            ipc_log.err("XDG_RUNTIME_DIR isn't set", .{});
+            return error.Expected;
+        };
+        const path = cmn.getSockPath(run_dir);
 
-    const ipc_fd = createSock(path.buf, path.len) catch |err| {
-        switch (err) {
-            error.NoSock   => ipc_log.err("Failed to create sock", .{}),
-            error.NoBind   => ipc_log.err("Failed to bind sock", .{}),
-            error.NoListen => ipc_log.err("Failed to start listening to sock", .{}),
-        }
-        return error.Expected;
+        const fd = createSock(path.buf, path.len) catch |err| {
+            switch (err) {
+                error.NoSock   => ipc_log.err("Failed to create sock", .{}),
+                error.NoBind   => ipc_log.err("Failed to bind sock", .{}),
+                error.NoListen => ipc_log.err("Failed to start listening to sock", .{}),
+            }
+            return error.Expected;
+        };
+
+        break :blk .{ .fd = fd, .path = path };
+    } else null;
+    defer if (ipc_sock) |ipc| {
+        _ = linux.close(ipc.fd);
+        _ = linux.unlink(ipc.path.buf[0..ipc.path.len:0]);
     };
-    defer {
-        _ = linux.close(ipc_fd);
-        _ = linux.unlink(path.buf[0..path.len:0]);
-    }
     const x_fd = cb.getXFileDescriptor();
 
     _ = cmn.call( linux.pipe(&sig_pipe) ) orelse {
@@ -73,22 +82,28 @@ fn run(init: std.process.Init) !void {
     };
 
     // FIXME: I'd want to use the shiny new Io interface, but I can't .poll() otherwise
-    var fds = [_]std.posix.pollfd{
+    var fds_buf = [_]std.posix.pollfd{
         .{ .fd = sig_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd =        x_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd =      ipc_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        undefined,
     };
-    while (true) {
-        _ = try std.posix.poll(&fds, -1);
+    var fds: []std.posix.pollfd = fds_buf[0..2];
+    if (ipc_sock) |ipc| {
+        fds = fds_buf[0..3];
+        fds[2] = .{ .fd = ipc.fd, .events = std.posix.POLL.IN, .revents = 0 };
+    }
 
-        if (fds[0].revents & std.posix.POLL.IN != 0) {
-            break;
-        }
+    while (true) {
+        _ = try std.posix.poll(fds, -1);
+
+        if (fds[0].revents & std.posix.POLL.IN != 0) break;
         if (fds[1].revents & std.posix.POLL.IN != 0) {
             _ = cb.drainXEvents();
         }
-        if (fds[2].revents & std.posix.POLL.IN != 0) {
-            handleIpcConnect(allocator, ipc_fd, &cb);
+        if (ipc_sock) |ipc| {
+            if (fds[2].revents & std.posix.POLL.IN != 0) {
+                handleIpcConnect(allocator, ipc.fd, &cb);
+            }
         }
     }
 }

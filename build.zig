@@ -5,6 +5,11 @@ const BuildContext = struct {
     target:   std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
 };
+const Options = struct {
+    module:       *std.Build.Module,
+    save_targets: bool,
+    ipc_sock:     bool,
+};
 
 pub fn build(b: *std.Build) void {
     const ctx: BuildContext = .{
@@ -17,23 +22,33 @@ pub fn build(b: *std.Build) void {
     const xcb = buildXcb(ctx);
     const lib = buildLib(ctx, &.{
         .{ .name = "xcb", .module = xcb },
-        .{ .name = "opt", .module = opt },
+        .{ .name = "opt", .module = opt.module },
     });
 
-    buildCli(ctx, &.{});
     buildDaemon(ctx, &.{
         .{ .name = "lib", .module = lib },
+        .{ .name = "opt", .module = opt.module },
     });
+    if (opt.ipc_sock) {
+        buildCli(ctx, &.{});
+    }
 }
 
-fn buildOptions(ctx: BuildContext) *std.Build.Module {
+fn buildOptions(ctx: BuildContext) Options {
     const b = ctx.b;
 
-    const save_targets = b.option(bool, "save-targets", "Claim CLIPBOARD_MANAGER and support SAVE_TARGETS requests (default: true)") orelse true;
+    const save_targets = b.option(bool, "save-targets", "Claim CLIPBOARD_MANAGER and support SAVE_TARGETS requests      (default: true)") orelse true;
+    const ipc_sock     = b.option(bool, "ipc-sock",     "Listen on $XDG_RUNTIME_DIR/copied.sock for copy/paste requests (default: true)") orelse true;
+
     const opt = b.addOptions();
     opt.addOption(bool, "save_targets", save_targets);
+    opt.addOption(bool, "ipc_sock",     ipc_sock);
 
-    return opt.createModule();
+    return .{
+        .module = opt.createModule(),
+        .save_targets = save_targets,
+        .ipc_sock     = ipc_sock,
+    };
 }
 
 fn buildXcb(ctx: BuildContext) *std.Build.Module {
