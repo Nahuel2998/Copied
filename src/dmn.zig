@@ -4,6 +4,8 @@ const linux = std.os.linux;
 const cmn = @import("cmn.zig");
 const Clipboard = @import("lib");
 
+const ipc_log = std.log.scoped(.ipc);
+
 var sig_pipe: [2]std.posix.fd_t = undefined;
 fn handleSigterm(_: linux.SIG) callconv(.c) void {
     _ = linux.write(sig_pipe[1], "please die", 1);
@@ -37,16 +39,16 @@ fn run(init: std.process.Init) !void {
     };
     const path = cmn.getSockPath(run_dir);
 
-    const cli_fd = createSock(path.buf, path.len) catch |err| {
+    const ipc_fd = createSock(path.buf, path.len) catch |err| {
         switch (err) {
-            error.NoSock   => std.log.err("Failed to create sock", .{}),
-            error.NoBind   => std.log.err("Failed to bind sock", .{}),
-            error.NoListen => std.log.err("Failed to start listening to sock", .{}),
+            error.NoSock   => ipc_log.err("Failed to create sock", .{}),
+            error.NoBind   => ipc_log.err("Failed to bind sock", .{}),
+            error.NoListen => ipc_log.err("Failed to start listening to sock", .{}),
         }
         return error.Expected;
     };
     defer {
-        _ = linux.close(cli_fd);
+        _ = linux.close(ipc_fd);
         _ = linux.unlink(path.buf[0..path.len:0]);
     }
     const x_fd = cb.getXFileDescriptor();
@@ -74,7 +76,7 @@ fn run(init: std.process.Init) !void {
     var fds = [_]std.posix.pollfd{
         .{ .fd = sig_pipe[0], .events = std.posix.POLL.IN, .revents = 0 },
         .{ .fd =        x_fd, .events = std.posix.POLL.IN, .revents = 0 },
-        .{ .fd =      cli_fd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd =      ipc_fd, .events = std.posix.POLL.IN, .revents = 0 },
     };
     while (true) {
         _ = try std.posix.poll(&fds, -1);
@@ -86,12 +88,12 @@ fn run(init: std.process.Init) !void {
             _ = cb.drainXEvents();
         }
         if (fds[2].revents & std.posix.POLL.IN != 0) {
-            handleCliConnect(allocator, cli_fd, &cb);
+            handleIpcConnect(allocator, ipc_fd, &cb);
         }
     }
 }
 
-fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboard) void {
+fn handleIpcConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboard) void {
     // TODO: recv timeout?
     const client: linux.fd_t = @intCast(cmn.call( linux.accept(sock, null, null) ) orelse return);
     defer _ = linux.close(client);
@@ -105,20 +107,20 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
     // |x|xx|xxxx|<mime>|<data>|
     var header_buf: [7]u8 = undefined;
     reader.readInto(&header_buf) catch |err| {
-        std.log.err("Failed to read header from client request: {}", .{err});
+        ipc_log.err("Failed to read header from request: {}", .{err});
         return;
     };
     const header = cmn.Header.deserialize(header_buf);
 
     const res_buf = allocator.alloc(u8, header.mime_len + header.data_len) catch {
-        std.log.err("Failed to alloc memory for client request", .{});
+        ipc_log.err("Failed to alloc memory for request", .{});
         return;
     };
     defer allocator.free(res_buf);
 
     const mime = res_buf[0..header.mime_len];
     reader.readInto(mime) catch |err| {
-        std.log.err("Failed to read mimetype from client request: {}", .{err});
+        ipc_log.err("Failed to read mimetype from request: {}", .{err});
         return;
     };
 
@@ -129,7 +131,7 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
             if (mime_atom == cb.atoms.get("TARGETS").?) {
                 var targets_buf: [1024]u8 = undefined;
                 data = cb.translateTargetsList(data, &targets_buf) catch |err| {
-                    std.log.err("Failed to get atom names building TARGETS response: {}", .{err});
+                    ipc_log.err("Failed to get atom names building TARGETS response: {}", .{err});
                     return;
                 };
             }
@@ -139,7 +141,7 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
                 data = std.fmt.bufPrint(&timestamp_buf, "{}\n", .{timestamp}) catch unreachable;
             }
             cmn.writeAll(client, data) catch |err| {
-                std.log.err("Failed to send data to client: {}", .{err});
+                ipc_log.err("Failed to send data: {}", .{err});
                 return;
             };
         },
@@ -148,13 +150,13 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
             if (header.data_len > 0) {
                 data = res_buf[header.mime_len..];
                 reader.readInto(data) catch |err| {
-                    std.log.err("Failed to read data from client request: {}", .{err});
+                    ipc_log.err("Failed to read data from request: {}", .{err});
                     return;
                 };
             }
             else {
                 data = reader.readRemainingAlloc(allocator) catch |err| {
-                    std.log.err("Failed to read data from client request: {}", .{err});
+                    ipc_log.err("Failed to read data from request: {}", .{err});
                     return;
                 };
             }
@@ -162,12 +164,12 @@ fn handleCliConnect(allocator: std.mem.Allocator, sock: linux.fd_t, cb: *Clipboa
 
             const mime_str  = if (mime.len != 0) mime else "UTF8_STRING";
             const mime_atom = cb.atoms.getIntern(mime_str) catch |err| {
-                std.log.err("Failed to save client data (mime): {}", .{err});
+                ipc_log.err("Failed to save data (mime): {}", .{err});
                 return;
             };
-            cb.copy(mime_atom, data) catch |err| {
-                std.log.err("Failed to save client data: {}", .{err});
-                return;
+            cb.copy(mime_atom, data) catch |err| switch (err) {
+                error.NotSavingMeta => ipc_log.warn("Refusing to save meta target: {s}", .{mime_str}),
+                else                => ipc_log.err("Failed to save data: {}", .{err}),
             };
         },
     }
