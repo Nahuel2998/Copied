@@ -93,6 +93,8 @@ pub fn deinit(self: *Self) void {
 }
 
 pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
+    if (self.isMetaTarget(mime)) return error.NotSavingMeta;
+
     self.claimOwnership();
     _ = c.xcb_flush(self.conn);
 
