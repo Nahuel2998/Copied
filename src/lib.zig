@@ -1,5 +1,7 @@
 const std = @import("std");
+
 const c   = @import("xcb");
+const opt = @import("opt");
 
 const Self = @This();
 
@@ -18,7 +20,7 @@ const RECV_PROPERTIES = blk: {
 };
 const SELECTION = "CLIPBOARD";
 
-const META_TARGETS       = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP", "SAVE_TARGETS"};
+const META_TARGETS       = [_][]const u8{"TARGETS", "MULTIPLE", "TIMESTAMP"} ++ if (opt.save_targets) .{"SAVE_TARGETS"} else .{};
 const OTHER_META_TARGETS = [_][]const u8{"DELETE", "INSERT_PROPERTY", "INSERT_SELECTION"}; // We don't support these yet
 
 const EAGER_COPY_TARGETS = [_][]const u8{"UTF8_STRING", "image/png", "text/uri-list"};
@@ -57,7 +59,9 @@ pub fn init(allocator: std.mem.Allocator) !Self {
     const max_request_len = c.xcb_get_maximum_request_length(conn);
     const max_transfer    = @min(MAX_TRANSFER_CAP, max_request_len * 4 - 100);
 
-    _ = c.xcb_set_selection_owner(conn, window, atoms.get("CLIPBOARD_MANAGER").?, c.XCB_CURRENT_TIME);
+    if (opt.save_targets) {
+        _ = c.xcb_set_selection_owner(conn, window, atoms.get("CLIPBOARD_MANAGER").?, c.XCB_CURRENT_TIME);
+    }
     _ = c.xcb_flush(conn);
 
     std.log.debug("My window is: {}", .{window});
@@ -197,14 +201,13 @@ fn initAtoms(conn: *c.xcb_connection_t, allocator: std.mem.Allocator) !AtomStash
     var atoms: AtomStash = .init(conn, allocator);
     const common_atoms = [_][]const u8{
         SELECTION,
-        "CLIPBOARD_MANAGER",
         "INCR",
         "UTF8_STRING",
         "STRING",
         "INTEGER",
         "ATOM",
         "ATOM_PAIR",
-    } ++ META_TARGETS ++ OTHER_META_TARGETS ++ EAGER_COPY_TARGETS ++ RECV_PROPERTIES;
+    } ++ META_TARGETS ++ OTHER_META_TARGETS ++ EAGER_COPY_TARGETS ++ RECV_PROPERTIES ++ if (opt.save_targets) .{"CLIPBOARD_MANAGER"} else .{};
     _ = try atoms.intern(common_atoms.len, common_atoms);
     return atoms;
 }
@@ -479,7 +482,7 @@ fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) voi
     // std.log.debug("Window {} wants to convert {s} to {}", .{ev.requestor, self.atoms.getName(ev.selection) catch "idk", ev.target});
     const handled = blk: {
         if (ev.selection != self.atoms.get(SELECTION).?) {
-            if (ev.target == self.atoms.get("SAVE_TARGETS").?) {
+            if (opt.save_targets and ev.target == self.atoms.get("SAVE_TARGETS").?) {
                 self.saveTargets(ev.time, ev.requestor, property) catch |err| {
                     std.log.err("Couldn't SAVE_TARGETS: {}", .{err});
                     break :blk false;

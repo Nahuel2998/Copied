@@ -12,16 +12,28 @@ pub fn build(b: *std.Build) void {
         .target   = b.standardTargetOptions(.{}),
         .optimize = b.standardOptimizeOption(.{}),
     };
+    const opt = buildOptions(ctx);
 
     const xcb = buildXcb(ctx);
     const lib = buildLib(ctx, &.{
         .{ .name = "xcb", .module = xcb },
+        .{ .name = "opt", .module = opt },
     });
 
     buildCli(ctx, &.{});
     buildDaemon(ctx, &.{
         .{ .name = "lib", .module = lib },
     });
+}
+
+fn buildOptions(ctx: BuildContext) *std.Build.Module {
+    const b = ctx.b;
+
+    const save_targets = b.option(bool, "save-targets", "Claim CLIPBOARD_MANAGER and support SAVE_TARGETS requests (default: true)") orelse true;
+    const opt = b.addOptions();
+    opt.addOption(bool, "save_targets", save_targets);
+
+    return opt.createModule();
 }
 
 fn buildXcb(ctx: BuildContext) *std.Build.Module {
