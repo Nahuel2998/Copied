@@ -105,13 +105,13 @@ pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
 }
 
 pub fn paste(self: *Self, sock: std.posix.fd_t, maybe_mime: ?c.xcb_atom_t) ?[]const u8 {
-    // FIXME: Temporary UTF8_STRING default
-    const mime = maybe_mime orelse self.atoms.get("UTF8_STRING").?;
+    if (maybe_mime) |mime| {
+        if (self.convertSelection(mime)) |res| return res.data;
+        if (self.selection_is_mine)            return null;
 
-    if (self.convertSelection(mime)) |res| return res.data;
-    if (self.selection_is_mine)            return null;
-
-    return self.retrieveSelection(self.last_event_time, mime, sock);
+        return self.retrieveSelection(self.last_event_time, mime, sock);
+    }
+    return self.dwimPaste();
 }
 
 pub fn reset(self: *Self) void {
@@ -299,21 +299,6 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
     self.getSomeTargets(ev.timestamp);
 }
 
-inline fn claimOwnership(self: *Self, timestamp: c.xcb_timestamp_t) void {
-    self.timestamp = timestamp;
-    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, timestamp);
-}
-
-fn getSomeTargets(self: *Self, timestamp: c.xcb_timestamp_t) void {
-    const targets_bytes = self.retrieveSelection(timestamp, self.atoms.get("TARGETS").?, null) orelse return;
-    const targets: []const c.xcb_atom_t = @ptrCast(@alignCast(targets_bytes));
-    for (targets) |mime| for (EAGER_COPY_TARGETS) |eager_copy| {
-        if (mime == self.atoms.get(eager_copy).?) {
-            _ = self.retrieveSelection(timestamp, mime, null);
-        }
-    };
-}
-
 // FIXME: I think if there's a pending selection and the owner changes and we use the same mime,
 //        we may still pass it as appropriate and save stale data, possibly double-writing or ignoring the actual good data
 //        Checking the timestamp may fix this
@@ -337,6 +322,120 @@ fn handleSelectionNotify(self: *Self, ev: *c.xcb_selection_notify_event_t) void 
 
     const cookie = self.getPropertyCookie(self.window, ev.property, true);
     self.readSelectionResponse(transfer, cookie);
+}
+
+fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) void {
+    self.last_event_time = ev.time;
+
+    const property = if (ev.property != c.XCB_ATOM_NONE) ev.property else ev.target;
+    var notify: c.xcb_selection_notify_event_t = .{
+        .response_type = c.XCB_SELECTION_NOTIFY,
+        .time          = ev.time,
+        .requestor     = ev.requestor,
+        .selection     = ev.selection,
+        .target        = ev.target,
+        .property      = property,
+    };
+
+    // std.log.debug("Window {} wants to convert {s} to {}", .{ev.requestor, self.atoms.getName(ev.selection) catch "idk", ev.target});
+    const handled = blk: {
+        if (ev.selection != self.atoms.get(SELECTION).?) {
+            if (opt.save_targets and ev.target == self.atoms.get("SAVE_TARGETS").?) {
+                self.saveTargets(ev.time, ev.requestor, property) catch |err| {
+                    std.log.err("Couldn't SAVE_TARGETS: {}", .{err});
+                    break :blk false;
+                };
+                break :blk true;
+            }
+            break :blk false;
+        }
+
+        // Rather than comparing timestamp:
+        // If we're no longer the owners, then we already cleared our data so we have nothing valid to send
+        if (!self.selection_is_mine) break :blk false;
+
+        if (ev.target == self.atoms.get("MULTIPLE").?) {
+            self.startMultipleSend(ev.time, ev.requestor, property) catch |err| {
+                std.log.err("Couldn't start MULTIPLE send due to: {}", .{err});
+                break :blk false;
+            };
+            break :blk true;
+        }
+
+        const data = self.convertSelection(ev.target) orelse break :blk false;
+        const ok   = self.sendData(ev.time, ev.requestor, property, data);
+        break :blk ok;
+    };
+    if (!handled) {
+        notify.property = c.XCB_ATOM_NONE;
+    }
+    _ = c.xcb_send_event(self.conn, 0, ev.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
+    _ = c.xcb_flush(self.conn);
+}
+
+fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
+    self.last_event_time = ev.time;
+
+    // std.log.debug("Received PropertyNotify for window {} for property {s} with state {}", .{ev.window, self.atoms.getName(ev.atom) catch "idk", ev.state});
+    if (ev.window == self.window) {
+        if (ev.state != c.XCB_PROPERTY_NEW_VALUE) return;
+        if (self.recv_pool.findByProperty(ev.atom)) |transfer| {
+            // std.log.debug("It belongs to a recv", .{});
+            if (transfer.incr_buf) |*incr_buf| {
+                // std.log.debug("an INCR to be specific", .{});
+                self.receiveIncr(transfer, incr_buf);
+            }
+        }
+        return;
+    }
+
+    if (ev.state != c.XCB_PROPERTY_DELETE) return;
+    if (self.incr_send.find(ev.window, ev.atom)) |transfer| {
+        const sent = transfer.sendChunk(self.conn, self.max_transfer) catch |err| blk: {
+            std.log.err("Failed to send chunk: {}", .{err});
+            transfer.active = false;
+            break :blk 0;
+        };
+        if (sent != 0) return;
+
+        transfer.disown(self.allocator);
+        if (!self.incr_send.haveAnyOf(transfer.requestor)) {
+            const evmask: u32 = c.XCB_EVENT_MASK_NO_EVENT;
+            _ = c.xcb_change_window_attributes(self.conn, transfer.requestor, c.XCB_CW_EVENT_MASK, &evmask);
+            _ = c.xcb_flush(self.conn);
+        }
+    }
+}
+
+inline fn claimOwnership(self: *Self, timestamp: c.xcb_timestamp_t) void {
+    self.timestamp = timestamp;
+    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, timestamp);
+}
+
+fn dwimPaste(self: *Self) ?[]const u8 {
+    const offers = self.clipboard.offers_len;
+    if (offers == 0) return null;
+
+    for (EAGER_COPY_TARGETS) |mime_name| {
+        const mime = self.atoms.get(mime_name).?;
+        if (self.convertSelection(mime)) |res| return res.data;
+    }
+
+    var res: []const u8 = &.{};
+    for (self.clipboard.data[0..offers]) |data| {
+        if (data.len > res.len) res = data;
+    }
+    return res;
+}
+
+fn getSomeTargets(self: *Self, timestamp: c.xcb_timestamp_t) void {
+    const targets_bytes = self.retrieveSelection(timestamp, self.atoms.get("TARGETS").?, null) orelse return;
+    const targets: []const c.xcb_atom_t = @ptrCast(@alignCast(targets_bytes));
+    for (targets) |mime| for (EAGER_COPY_TARGETS) |eager_copy| {
+        if (mime == self.atoms.get(eager_copy).?) {
+            _ = self.retrieveSelection(timestamp, mime, null);
+        }
+    };
 }
 
 fn readSelectionResponse(self: *Self, transfer: *RecvTransfer, cookie: c.xcb_get_property_cookie_t) void {
@@ -396,40 +495,6 @@ fn isMetaTarget(self: *Self, mime: c.xcb_atom_t) bool {
     return false;
 }
 
-fn handlePropertyNotify(self: *Self, ev: *c.xcb_property_notify_event_t) void {
-    self.last_event_time = ev.time;
-
-    // std.log.debug("Received PropertyNotify for window {} for property {s} with state {}", .{ev.window, self.atoms.getName(ev.atom) catch "idk", ev.state});
-    if (ev.window == self.window) {
-        if (ev.state != c.XCB_PROPERTY_NEW_VALUE) return;
-        if (self.recv_pool.findByProperty(ev.atom)) |transfer| {
-            // std.log.debug("It belongs to a recv", .{});
-            if (transfer.incr_buf) |*incr_buf| {
-                // std.log.debug("an INCR to be specific", .{});
-                self.receiveIncr(transfer, incr_buf);
-            }
-        }
-        return;
-    }
-
-    if (ev.state != c.XCB_PROPERTY_DELETE) return;
-    if (self.incr_send.find(ev.window, ev.atom)) |transfer| {
-        const sent = transfer.sendChunk(self.conn, self.max_transfer) catch |err| blk: {
-            std.log.err("Failed to send chunk: {}", .{err});
-            transfer.active = false;
-            break :blk 0;
-        };
-        if (sent != 0) return;
-
-        transfer.disown(self.allocator);
-        if (!self.incr_send.haveAnyOf(transfer.requestor)) {
-            const evmask: u32 = c.XCB_EVENT_MASK_NO_EVENT;
-            _ = c.xcb_change_window_attributes(self.conn, transfer.requestor, c.XCB_CW_EVENT_MASK, &evmask);
-            _ = c.xcb_flush(self.conn);
-        }
-    }
-}
-
 fn receiveIncr(self: *Self, transfer: *RecvTransfer, incr_buf: *std.ArrayList(u8)) void {
     const reply = self.getProperty(self.window, transfer.property, true) catch |err| {
         std.log.err("Failed to read INCR chunk: {}", .{err});
@@ -468,55 +533,6 @@ fn getProperty(self: Self, window: c.xcb_window_t, property: c.xcb_atom_t, delet
 inline fn getPropertyCookie(self: Self, window: c.xcb_window_t, property: c.xcb_atom_t, delete: bool) c.xcb_get_property_cookie_t {
     // std.log.debug("Reading property {s} of window {}; delete={}", .{self.atoms.ehcac.get(property) orelse "idk", window, delete});
     return c.xcb_get_property(self.conn, @intFromBool(delete), window, property, c.XCB_GET_PROPERTY_TYPE_ANY, 0, std.math.maxInt(u32) / 4);
-}
-
-fn handleSelectionRequest(self: *Self, ev: *c.xcb_selection_request_event_t) void {
-    self.last_event_time = ev.time;
-
-    const property = if (ev.property != c.XCB_ATOM_NONE) ev.property else ev.target;
-    var notify: c.xcb_selection_notify_event_t = .{
-        .response_type = c.XCB_SELECTION_NOTIFY,
-        .time          = ev.time,
-        .requestor     = ev.requestor,
-        .selection     = ev.selection,
-        .target        = ev.target,
-        .property      = property,
-    };
-
-    // std.log.debug("Window {} wants to convert {s} to {}", .{ev.requestor, self.atoms.getName(ev.selection) catch "idk", ev.target});
-    const handled = blk: {
-        if (ev.selection != self.atoms.get(SELECTION).?) {
-            if (opt.save_targets and ev.target == self.atoms.get("SAVE_TARGETS").?) {
-                self.saveTargets(ev.time, ev.requestor, property) catch |err| {
-                    std.log.err("Couldn't SAVE_TARGETS: {}", .{err});
-                    break :blk false;
-                };
-                break :blk true;
-            }
-            break :blk false;
-        }
-
-        // Rather than comparing timestamp:
-        // If we're no longer the owners, then we already cleared our data so we have nothing valid to send
-        if (!self.selection_is_mine) break :blk false;
-
-        if (ev.target == self.atoms.get("MULTIPLE").?) {
-            self.startMultipleSend(ev.time, ev.requestor, property) catch |err| {
-                std.log.err("Couldn't start MULTIPLE send due to: {}", .{err});
-                break :blk false;
-            };
-            break :blk true;
-        }
-
-        const data = self.convertSelection(ev.target) orelse break :blk false;
-        const ok   = self.sendData(ev.time, ev.requestor, property, data);
-        break :blk ok;
-    };
-    if (!handled) {
-        notify.property = c.XCB_ATOM_NONE;
-    }
-    _ = c.xcb_send_event(self.conn, 0, ev.requestor, c.XCB_EVENT_MASK_NO_EVENT, @ptrCast(&notify));
-    _ = c.xcb_flush(self.conn);
 }
 
 fn saveTargets(self: *Self, timestamp: c.xcb_timestamp_t, window: c.xcb_window_t, property: c.xcb_atom_t) !void {
