@@ -74,6 +74,9 @@ fn run(init: std.process.Init) !void {
         try modeRead(io, sock, mime);
     }
     else {
+        if (source == .filename and mime.len == 0) {
+            mime = "text/uri-list";
+        }
         try modeWrite(io, sock, mime, source);
     }
 }
@@ -103,14 +106,23 @@ fn modeRead(io: std.Io, sock: linux.fd_t, mime: []const u8) !void {
 }
 
 fn modeWrite(io: std.Io, sock: linux.fd_t, mime: []const u8, source: Source) !void {
+    var buf: [cmn.BUF_SIZE]u8 = undefined;
+    var direct_send: ?[]const u8 = null;
+
     var data_len: usize = 0;
     var file = stdin;
     switch (source) {
         .filename => |filepath| {
-            file = try std.Io.Dir.cwd().openFile(io, filepath, .{});
+            if (std.mem.eql(u8, mime, "text/uri-list")) {
+                direct_send = try uriFormat(io, filepath, &buf);
+                data_len    = direct_send.?.len;
+            }
+            else {
+                file = try std.Io.Dir.cwd().openFile(io, filepath, .{});
 
-            const stat = try file.stat(io);
-            data_len = stat.size;
+                const stat = try file.stat(io);
+                data_len = stat.size;
+            }
         },
         .stdin => {},
         .none  => unreachable,
@@ -129,8 +141,11 @@ fn modeWrite(io: std.Io, sock: linux.fd_t, mime: []const u8, source: Source) !vo
         try cmn.writeAll(sock, mime);
     }
 
-    var buf: [cmn.BUF_SIZE]u8 = undefined;
-    while (true) {
+    if (direct_send) |data| {
+        std.debug.assert(data.len == data_len);
+        try cmn.writeAll(sock, data);
+    }
+    else while (true) {
         const send = try readFileChunk(io, file, &buf);
         try cmn.writeAll(sock, send);
         if (send.len < buf.len) break;
@@ -146,6 +161,25 @@ fn readFileChunk(io: std.Io, file: std.Io.File, buf: []u8) ![]u8 {
         };
         if (i == buf.len) return buf;
     }
+}
+
+fn uriFormat(io: std.Io, filepath: []const u8, buf: []u8) ![]u8 {
+    var   fba       = std.heap.FixedBufferAllocator.init(buf);
+    const allocator = fba.allocator();
+
+    const abspath = if (std.fs.path.isAbsolute(filepath)) filepath else blk: {
+        const cwd      = try std.process.currentPathAlloc(io, allocator);
+        const resolved = try std.fs.path.resolve(allocator, &.{ cwd, filepath });
+        break :blk resolved;
+    };
+
+    var w = std.Io.Writer.Allocating.init(allocator);
+    try w.writer.writeAll("file://");
+
+    const uri = std.Uri.Component{ .raw = abspath };
+    try uri.formatPath(&w.writer);
+
+    return w.written();
 }
 
 fn log(io: std.Io, comptime message: []const u8) !void {
