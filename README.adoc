@@ -1,9 +1,118 @@
 = Copied
+:author: Na_P
+:toc:
+
+== What
 Clipboard Optimized and Polished for Immortalizing Existing Data
 
 ( or a few of these words at least )
 
-== Why
-I just want a simple clipboard manager that does what I mean.
+'''
 
-Also mostly an excuse to try libxcb and Zig.
+It's a simple unmapped X11 window accepting input in `$XDG_RUNTIME_DIR/copied.sock`
+
+It takes ownership upon receiving a copy request
+
+It relays paste requests to the current clipboard owner, caching results, and takes ownership (supporting `SAVE_TARGETS` requests) once it dies
+
+It eagerly copies a list of targets (`EAGER_COPY_TARGETS` in link:src/lib.zig[]) in case the owner doesn't support `SAVE_TARGETS`
+
+== How
+=== Compile
+.Release build
+[source,sh]
+----
+zig build -Doptimize=ReleaseFast
+----
+
+.Extra compile options
+----
+-Dipc-sock=[bool]      Listen on $XDG_RUNTIME_DIR/copied.sock for copy/paste requests (default: true)
+-Dsave-targets=[bool]  Claim CLIPBOARD_MANAGER and support SAVE_TARGETS requests      (default: true)
+----
+
+Use `-Dipc-sock=false` if you won't use the cli and just want something that persists the clipboard when a window exits
+
+Use `-Dsave-targets=false` to prevent windows from asking us to save their data when they close; might speed up window-closing if they're slow, but some data may be lost
+
+NOTE: Very few clients actually support `SAVE_TARGETS`, some even announce they do yet they don't, so it won't change much
+
+=== Run daemon
+.Run daemon
+[source,sh]
+----
+copiedd
+----
+
+`copiedd` is the daemon that listens for clipboard changes and replies to windows (or `copied.sock` if `ipc-sock` is enabled)'s requests
+
+`copied` is a simple cli to connect to `copied.sock` and do copy/paste requests. The message format is simple enough to be easy to make your own without having X11 stuff in your project
+
+=== Copy
+.Copy contents
+[source,sh]
+----
+cat file | copied
+copied < file
+----
+
+The default format for copying contents is `UTF8_STRING`
+
+.Copy file
+[source,sh]
+----
+copied file
+----
+
+The default format for copying a file is `text/uri-list` (this won't copy the contents)
+
+.Copy specific format
+[source,sh]
+----
+cat img.png | copied -t image/png
+copied -t image/png < img.png
+copied -t image/png img.png
+----
+
+=== Paste
+.Check paste targets
+[source,sh]
+----
+copied -t TARGETS
+----
+
+.Paste an specific format
+[source,sh]
+----
+copied -t image/png > img.png
+----
+
+.Paste what you mean
+[source,sh]
+----
+copied
+----
+
+Without specifying target it's gonna attempt to paste `EAGER_COPY_TARGETS` from left to right
+
+If that fails, it's gonna paste whichever format has the most bytes
+
+== Why
+I just wanted a simple clipboard manager that does what I mean
+
+Also mostly an excuse to try https://xcb.freedesktop.org[libxcb] and https://ziglang.org[Zig]
+
+[qanda]
+Why is every file three letters?::
+Well I saw how `cli`/`x11`/`xcb` were three characters each so I just had to keep it going
+
+== Thank / References
+* https://github.com/astrand/xclip[xclip]: Was my previous clipboard manager
+* https://github.com/kfish/xsel[xsel]: And its beautiful rant
+* https://github.com/jtanx/libclipboard[libclipboard]: xcb knowledge
+* https://github.com/cdown/clipmenu[clipmenu]: XFixes knowledge
+* https://github.com/ColleagueRiley/Clipboard-Copy-Paste[ColleagueRiley]: SAVE_TARGETS knowledge
+* https://tronche.com/gui/x/icccm/sec-2.html[ICCCM Section 2]: what do you mean every single client has to follow this insanity
+* https://www.freedesktop.org/wiki/ClipboardManager[ClipboardManager Spec]: I wish more clients followed it
+* https://savannah.gnu.org/projects/emacs/[Emacs]: For being so compliant
+* https://chromium.googlesource.com/chromium/src/+/refs/heads/main[Chromium]: For making me lose hope in other clients being compliant
