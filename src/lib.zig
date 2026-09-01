@@ -38,7 +38,9 @@ allocator: std.mem.Allocator,
 xfixes_base:  u8,
 max_transfer: u32,
 
-last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME, // FIXME: This is somewhat non-compliant
+// We save the time of the last event to avoid doing the "zero-length append to a property" the ICCCM suggests
+// FIXME: This is somewhat non-compliant
+last_event_time: c.xcb_timestamp_t = c.XCB_CURRENT_TIME,
 selection_is_mine: bool = false,
 
 incr_send: SendRing = .{},
@@ -95,7 +97,7 @@ pub fn deinit(self: *Self) void {
 pub fn copy(self: *Self, mime: c.xcb_atom_t, data: []const u8) !void {
     if (self.isMetaTarget(mime)) return error.NotSavingMeta;
 
-    self.claimOwnership();
+    self.claimOwnership(self.last_event_time);
     _ = c.xcb_flush(self.conn);
 
     self.reset();
@@ -282,7 +284,7 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
     std.log.debug("Ownership changed to: {}", .{ev.owner});
     if (ev.owner == c.XCB_NONE) {
         self.recv_pool.failAll(self.allocator);
-        self.claimOwnership();
+        self.claimOwnership(ev.timestamp);
         _ = c.xcb_flush(self.conn);
         return;
     }
@@ -297,9 +299,9 @@ fn handleXFixesSelectionNotify(self: *Self, ev: *c.xcb_xfixes_selection_notify_e
     self.getSomeTargets(ev.timestamp);
 }
 
-inline fn claimOwnership(self: *Self) void {
-    self.timestamp = self.last_event_time;
-    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, self.timestamp);
+inline fn claimOwnership(self: *Self, timestamp: c.xcb_timestamp_t) void {
+    self.timestamp = timestamp;
+    _ = c.xcb_set_selection_owner(self.conn, self.window, self.atoms.get(SELECTION).?, timestamp);
 }
 
 fn getSomeTargets(self: *Self, timestamp: c.xcb_timestamp_t) void {
@@ -550,7 +552,7 @@ fn saveTargets(self: *Self, timestamp: c.xcb_timestamp_t, window: c.xcb_window_t
 
     std.log.debug("Saving {} targets from window {}", .{targets.len, window});
     self.retrieveMultiple(timestamp, targets);
-    self.claimOwnership();
+    self.claimOwnership(timestamp);
 }
 
 fn convertSelection(self: *Self, mime: c.xcb_atom_t) ?SendData {
